@@ -1,6 +1,17 @@
 # Changelog
 
-All notable changes to Fan Control TUI are documented here.
+All notable changes to fantop are documented here.
+
+## 4.0.0 - 2026-07-11
+
+### Changed
+
+- Renamed the utility, executable, module, runtime paths, systemd units, profiles,
+  installer variables, documentation, and repository to `fantop`
+- Added automatic migration from legacy configuration and profile locations
+- Added automatic cleanup of legacy cron entries, systemd units, and launchers
+- Highlighted the selected PWM card border and title in red
+- Installed `fantop` into the user PATH for launching from any directory
 
 ## 3.0.0 - 2026-07-11
 

@@ -5,10 +5,10 @@ Contributions are welcome through focused issues and pull requests.
 ## Development setup
 
 1. Use Linux with Python 3.10 or newer.
-2. Run `python3 -m py_compile fan_control.py`.
-3. Run `bash -n fan-control install.sh uninstall.sh`.
+2. Run `python3 -m py_compile fantop.py`.
+3. Run `bash -n fantop install.sh uninstall.sh`.
 4. Run `python3 -m unittest discover -s tests -v`.
-5. Use `./fan-control --doctor`, `--discover`, and `--dry-run` for read-only checks.
+5. Use `./fantop --doctor`, `--discover`, and `--dry-run` for read-only checks.
 6. Do not run `--apply` or `--calibrate` on unverified hardware.
 
 ## Pull requests

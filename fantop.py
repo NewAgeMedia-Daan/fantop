@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NAM server fan-control engine and terminal curve editor."""
+"""fantop: Linux hwmon fan-control engine and terminal curve editor."""
 
 from __future__ import annotations
 
@@ -23,12 +23,17 @@ from typing import Any
 
 SCRIPT = Path(__file__).resolve()
 USER_HOME = SCRIPT.parent
-CONFIG_FILE = USER_HOME / ".config" / "nam-fan-control" / "config.json"
+CONFIG_FILE = USER_HOME / ".config" / "fantop" / "config.json"
 STATE_FILE = CONFIG_FILE.parent / "state.json"
-LOG_FILE = CONFIG_FILE.parent / "fan-control.log"
-LOCK_FILE = Path("/run/nam-fan-control.lock")
-CRON_MARKER = "# fan-control-tui (managed; do not edit)"
-APP_VERSION = "3.0.0"
+LOG_FILE = CONFIG_FILE.parent / "fantop.log"
+LOCK_FILE = Path("/run/fantop.lock")
+CRON_MARKER = "# fantop (managed; do not edit)"
+LEGACY_CRON_MARKERS = ("# fan-control-tui (managed; do not edit)",
+                       "# nam-fan-control (managed by fan_control.py)")
+LEGACY_CONFIG_DIRS = (USER_HOME / ".config" / "nam-fan-control",
+                      USER_HOME.parent / "fan-control-tui" / ".config" / "nam-fan-control",
+                      Path.home() / ".config" / "nam-fan-control")
+APP_VERSION = "4.0.0"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 3,
@@ -164,12 +169,25 @@ def discover_controllers(active_only: bool = True) -> list[dict[str, Any]]:
 
 def load_config() -> dict[str, Any]:
     if not CONFIG_FILE.exists():
+        for legacy_dir in LEGACY_CONFIG_DIRS:
+            legacy_config = legacy_dir / "config.json"
+            if not legacy_config.exists(): continue
+            with legacy_config.open(encoding="utf-8") as handle:
+                migrated = validate_config(json.load(handle))
+            atomic_save(migrated)
+            for old_name, new_path in (("state.json", STATE_FILE), ("fan-control.log", LOG_FILE)):
+                old_path = legacy_dir / old_name
+                if old_path.exists() and not new_path.exists():
+                    try: shutil.copy2(old_path, new_path)
+                    except PermissionError: pass
+            return migrated
         return copy.deepcopy(DEFAULT_CONFIG)
     with CONFIG_FILE.open(encoding="utf-8") as handle:
         return validate_config(json.load(handle))
 
 
-def atomic_save(data: dict[str, Any], path: Path = CONFIG_FILE) -> None:
+def atomic_save(data: dict[str, Any], path: Path | None = None) -> None:
+    path = path or CONFIG_FILE
     validate_config(data)
     path.parent.mkdir(parents=True, exist_ok=True)
     try: original = path.stat()
@@ -206,7 +224,7 @@ def save_state(temps: dict[str, float], pwms: dict[str, int]) -> None:
 
 
 def get_logger(config: dict[str, Any]) -> logging.Logger:
-    logger = logging.getLogger("fan-control-tui")
+    logger = logging.getLogger("fantop")
     if logger.handlers: return logger
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     control = config.get("control", {})
@@ -424,14 +442,14 @@ def install_cron(config: dict[str, Any]) -> None:
     cleaned: list[str] = []
     skip_next = False
     for line in lines:
-        if line.strip() in (CRON_MARKER, "# nam-fan-control (managed by fan_control.py)"):
+        if line.strip() in (CRON_MARKER, *LEGACY_CRON_MARKERS):
             skip_next = True
             continue
-        if skip_next and ("fan_control.py" in line or "fan_control.sh" in line):
+        if skip_next and any(name in line for name in ("fantop.py", "fan_control.py", "fan_control.sh")):
             skip_next = False
             continue
         skip_next = False
-        if "fan_control.sh" in line or "fan_control.py" in line:
+        if any(name in line for name in ("fantop.py", "fan_control.py", "fan_control.sh")):
             continue
         cleaned.append(line)
     while cleaned and not cleaned[-1].strip():
@@ -445,16 +463,25 @@ def install_cron(config: dict[str, Any]) -> None:
 def install_systemd(config: dict[str, Any]) -> None:
     if os.geteuid() != 0: raise PermissionError("Scheduler installation must run as root")
     minutes = config.get("schedule_minutes", 1)
-    service = f"""[Unit]\nDescription=Fan Control TUI curve application\nAfter=lm-sensors.service\nOnFailure=fan-control-tui-failsafe.service\n\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 \"{SCRIPT}\" --apply\n"""
-    failsafe_service = f"""[Unit]\nDescription=Fan Control TUI emergency fail-safe\n\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 \"{SCRIPT}\" --fail-safe\n"""
-    timer = f"""[Unit]\nDescription=Run Fan Control TUI every {minutes} minute(s)\n\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec={minutes}min\nAccuracySec=1s\nPersistent=true\nUnit=fan-control-tui.service\n\n[Install]\nWantedBy=timers.target\n"""
-    Path("/etc/systemd/system/fan-control-tui.service").write_text(service)
-    Path("/etc/systemd/system/fan-control-tui.timer").write_text(timer)
-    Path("/etc/systemd/system/fan-control-tui-failsafe.service").write_text(failsafe_service)
+    service = f"""[Unit]\nDescription=fantop curve application\nAfter=lm-sensors.service\nOnFailure=fantop-failsafe.service\n\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 \"{SCRIPT}\" --apply\n"""
+    failsafe_service = f"""[Unit]\nDescription=fantop emergency fail-safe\n\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 \"{SCRIPT}\" --fail-safe\n"""
+    timer = f"""[Unit]\nDescription=Run fantop every {minutes} minute(s)\n\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec={minutes}min\nAccuracySec=1s\nPersistent=true\nUnit=fantop.service\n\n[Install]\nWantedBy=timers.target\n"""
+    Path("/etc/systemd/system/fantop.service").write_text(service)
+    Path("/etc/systemd/system/fantop.timer").write_text(timer)
+    Path("/etc/systemd/system/fantop-failsafe.service").write_text(failsafe_service)
+    remove_legacy_systemd()
     subprocess.run(["systemctl", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "enable", "--now", "fan-control-tui.timer"], check=True)
+    subprocess.run(["systemctl", "enable", "--now", "fantop.timer"], check=True)
     remove_cron()
     print(f"Systemd timer active every {minutes} minute(s)")
+
+
+def remove_legacy_systemd() -> None:
+    if not shutil.which("systemctl"): return
+    subprocess.run(["systemctl", "disable", "--now", "fan-control-tui.timer"], capture_output=True)
+    for name in ("fan-control-tui.timer", "fan-control-tui.service", "fan-control-tui-failsafe.service"):
+        try: (Path("/etc/systemd/system") / name).unlink()
+        except FileNotFoundError: pass
 
 
 def remove_cron() -> None:
@@ -464,9 +491,9 @@ def remove_cron() -> None:
     if proc.returncode != 0: return
     lines, cleaned, skip = proc.stdout.splitlines(), [], False
     for line in lines:
-        if line.strip() in (CRON_MARKER, "# nam-fan-control (managed by fan_control.py)"):
+        if line.strip() in (CRON_MARKER, *LEGACY_CRON_MARKERS):
             skip = True; continue
-        if skip and ("fan_control.py" in line or "fan_control.sh" in line): skip = False; continue
+        if skip and any(name in line for name in ("fantop.py", "fan_control.py", "fan_control.sh")): skip = False; continue
         skip = False; cleaned.append(line)
     subprocess.run(["crontab", "-"], input="\n".join(cleaned) + "\n", text=True, check=True)
 
@@ -481,13 +508,14 @@ def install_scheduler(config: dict[str, Any]) -> None:
 def uninstall_scheduler() -> None:
     if os.geteuid() != 0: raise PermissionError("Uninstall must run as root")
     if shutil.which("systemctl"):
-        subprocess.run(["systemctl", "disable", "--now", "fan-control-tui.timer"], capture_output=True)
-    for path in (Path("/etc/systemd/system/fan-control-tui.timer"), Path("/etc/systemd/system/fan-control-tui.service"),
-                 Path("/etc/systemd/system/fan-control-tui-failsafe.service")):
+        subprocess.run(["systemctl", "disable", "--now", "fantop.timer"], capture_output=True)
+        remove_legacy_systemd()
+    for path in (Path("/etc/systemd/system/fantop.timer"), Path("/etc/systemd/system/fantop.service"),
+                 Path("/etc/systemd/system/fantop-failsafe.service")):
         try: path.unlink()
         except FileNotFoundError: pass
     if shutil.which("systemctl"): subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
-    remove_cron(); print("Fan Control TUI scheduler removed")
+    remove_cron(); print("fantop scheduler removed")
 
 
 def restore_auto(config: dict[str, Any]) -> None:
@@ -547,7 +575,7 @@ def calibrate(config: dict[str, Any], confirmed: bool = False) -> None:
     atomic_save(config); print("Calibration saved; original PWM modes and values restored")
 
 
-class FanTUI:
+class FantopTUI:
     def __init__(self, screen: curses.window, config: dict[str, Any]):
         self.screen = screen
         self.config, self.saved = copy.deepcopy(config), copy.deepcopy(config)
@@ -599,7 +627,7 @@ class FanTUI:
     def box(self, y: int, x: int, h: int, w: int, title: str, selected: bool = False) -> None:
         if h < 3 or w < 5:
             return
-        attr = curses.color_pair(1) | (curses.A_BOLD if selected else 0)
+        attr = curses.color_pair(4 if selected else 1) | (curses.A_BOLD if selected else 0)
         self.put(y, x, "+" + "-" * (w - 2) + "+", attr)
         for row in range(y + 1, y + h - 1):
             self.put(row, x, "|", attr); self.put(row, x + w - 1, "|", attr)
@@ -619,8 +647,8 @@ class FanTUI:
         if not force and time.monotonic() - self.last_schedule_check < 5:
             return
         self.last_schedule_check = time.monotonic()
-        active = subprocess.run(["systemctl", "is-active", "fan-control-tui.timer"], capture_output=True, text=True) if shutil.which("systemctl") else None
-        timer = Path("/etc/systemd/system/fan-control-tui.timer")
+        active = subprocess.run(["systemctl", "is-active", "fantop.timer"], capture_output=True, text=True) if shutil.which("systemctl") else None
+        timer = Path("/etc/systemd/system/fantop.timer")
         try: correct = f"OnUnitActiveSec={self.config.get('schedule_minutes', 1)}min" in timer.read_text()
         except OSError: correct = False
         self.schedule_active = active is not None and active.stdout.strip() == "active" and correct
@@ -708,7 +736,7 @@ class FanTUI:
         if rows < 28 or columns < 90:
             self.put(0, 0, f"Terminal too small ({columns}x{rows}); resize to at least 90x28.", curses.color_pair(4) | curses.A_BOLD)
             self.screen.refresh(); return
-        self.put(0, 0, " NAM Fan Control " + ("[UNSAVED]" if self.dirty else "[saved]"), curses.color_pair(1) | curses.A_BOLD)
+        self.put(0, 0, " fantop " + ("[UNSAVED]" if self.dirty else "[saved]"), curses.color_pair(1) | curses.A_BOLD)
         header_help = "[? Help]"
         help_x = max(0, columns - 48)
         self.put(0, help_x, f"1-9 select | Tab cycle | {header_help} | q exit")
@@ -787,7 +815,7 @@ class FanTUI:
         try:
             print("\nRunning: " + " ".join(command))
             result = subprocess.run(command, text=True)
-            input("Press Enter to return to Fan Control...")
+            input("Press Enter to return to fantop...")
             return result
         finally:
             curses.reset_prog_mode(); curses.curs_set(0); self.screen.keypad(True); self.screen.clear()
@@ -823,7 +851,7 @@ class FanTUI:
             self.status, self.status_error = "Export cancelled", False
             return
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        prefix = f"FanExport_{profile_slug(label)}_{stamp}" if label else f"FanExport_{stamp}"
+        prefix = f"FantopExport_{profile_slug(label)}_{stamp}" if label else f"FantopExport_{stamp}"
         path, counter = USER_HOME / f"{prefix}.json", 1
         while path.exists():
             path = USER_HOME / f"{prefix}_{counter}.json"; counter += 1
@@ -836,9 +864,9 @@ class FanTUI:
             self.status, self.status_error = f"Export failed: {exc}", True
 
     def choose_import(self) -> None:
-        exports = sorted(USER_HOME.glob("FanExport_*.json"), reverse=True)
+        exports = sorted((*USER_HOME.glob("FantopExport_*.json"), *USER_HOME.glob("FanExport_*.json")), reverse=True)
         if not exports:
-            self.status, self.status_error = "No FanExport_*.json files found in your home", True; return
+            self.status, self.status_error = "No FantopExport_*.json files found in your home", True; return
         choice = 0
         while True:
             self.screen.erase(); rows, columns = self.screen.getmaxyx()
@@ -863,10 +891,10 @@ class FanTUI:
                     if confirmed and label:
                         profile["profile_name"] = label[:80]
                         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        destination = USER_HOME / f"FanExport_{profile_slug(label)}_{stamp}.json"
+                        destination = USER_HOME / f"FantopExport_{profile_slug(label)}_{stamp}.json"
                         counter = 1
                         while destination.exists():
-                            destination = USER_HOME / f"FanExport_{profile_slug(label)}_{stamp}_{counter}.json"; counter += 1
+                            destination = USER_HOME / f"FantopExport_{profile_slug(label)}_{stamp}_{counter}.json"; counter += 1
                         atomic_save(profile, destination); exports[choice].unlink(); exports[choice] = destination
                         self.status, self.status_error = f"Profile renamed to {label}", False
                 except Exception as exc: self.status, self.status_error = f"Rename failed: {exc}", True
@@ -1109,7 +1137,7 @@ class FanTUI:
 def run_tui(config: dict[str, Any]) -> None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError("The editor needs an interactive terminal")
-    curses.wrapper(lambda screen: FanTUI(screen, config).run())
+    curses.wrapper(lambda screen: FantopTUI(screen, config).run())
 
 
 def print_status(config: dict[str, Any]) -> None:
@@ -1151,7 +1179,7 @@ def main() -> int:
     parser.add_argument("--discover", action="store_true", help="list controllable PWM channels")
     parser.add_argument("--all-channels", action="store_true", help="include zero-RPM channels")
     parser.add_argument("--schedule", type=int, choices=(1,2,3,5,10,15,30,60), help="scheduler interval in minutes")
-    parser.add_argument("--version", action="version", version=f"fan-control-tui {APP_VERSION}")
+    parser.add_argument("--version", action="version", version=f"fantop {APP_VERSION}")
     args = parser.parse_args()
     try:
         config = load_config()
@@ -1186,7 +1214,7 @@ def main() -> int:
         if not any(actions): run_tui(config)
         return 0
     except KeyboardInterrupt: return 130
-    except Exception as exc: print(f"fan-control: {exc}", file=sys.stderr); return 1
+    except Exception as exc: print(f"fantop: {exc}", file=sys.stderr); return 1
 
 
 if __name__ == "__main__":

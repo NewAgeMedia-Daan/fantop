@@ -1,13 +1,14 @@
-# Fan Control TUI — BIOS-style fan curves in your terminal
+# fantop — BIOS-style fan curves in your terminal
 
 Lightweight Linux terminal fan-curve editor and controller using only Python's
 standard library, `lm-sensors`, Linux hwmon sysfs, and systemd or cron. It supports color,
 keyboard-only operation, and terminal mouse input.
-Version 3 adds fail-safe control, smoothing, calibration, rotating logs, dynamic
-channel setup, and systemd-first scheduling with cron fallback.
+fantop combines a btop-style terminal experience with fail-safe control,
+smoothing, calibration, rotating logs, dynamic channel setup, and systemd-first
+scheduling with cron fallback.
 
 > [!CAUTION]
-> Fan Control TUI writes directly to Linux hwmon PWM controls. Verify hardware,
+> fantop writes directly to Linux hwmon PWM controls. Verify hardware,
 > sensors, and minimum safe speeds before enabling unattended operation.
 
 ## Contents
@@ -21,9 +22,9 @@ channel setup, and systemd-first scheduling with cron fallback.
 
 ## System requirements and prerequisites
 
-Fan Control TUI requires:
+fantop requires:
 
-- Linux with `/sys/class/hwmon` and a loaded motherboard or fan-controller driver
+- Linux with `/sys/class/hwmon` and a loaded motherboard or fan controller driver
 - At least one channel exposing `pwmN` and `pwmN_enable`; `fanN_input` is strongly
   recommended so inactive headers can be hidden and RPM can be monitored
 - Python 3.10 or newer with the standard `curses` module
@@ -67,10 +68,18 @@ separately as `python3-curses`.
 ## Installation
 
 Choose a stable installation directory. The managed scheduler stores the absolute path to
-`fan_control.py`, so do not move or delete that directory after enabling the
+`fantop.py`, so do not move or delete that directory after enabling the
 schedule.
 
-From a downloaded or cloned source directory:
+Clone and install the latest release:
+
+```bash
+git clone https://github.com/NewAgeMedia-Daan/fantop.git
+cd fantop
+./install.sh
+```
+
+Or, from an already downloaded source directory:
 
 ```bash
 ./install.sh
@@ -79,39 +88,44 @@ From a downloaded or cloned source directory:
 Ensure `~/.local/bin` is on `PATH`, then verify the installation:
 
 ```bash
-fan-control --version
-fan-control --doctor
-fan-control --discover
+fantop --version
+fantop --doctor
+fantop --discover
 ```
+
+The installer creates both `~/.local/bin/fantop` and `/usr/local/bin/fantop`, so
+the utility can be launched as `fantop` from any working directory and remains
+available through `sudo fantop`. It also migrates legacy configurations and
+removes the previous launcher name.
 
 `--discover` shows active channels with tachometer feedback. To diagnose all
 PWM headers, including unused or zero-RPM channels, run:
 
 ```bash
-fan-control --discover --all-channels
+fantop --discover --all-channels
 ```
 
 Discovery is read-only and does not change fan speeds.
 
 ## First-time setup
 
-1. Run `fan-control --doctor` and resolve every failed prerequisite.
-2. Run `fan-control --discover` and verify the detected controller and channels.
-3. Run `fan-control --setup` to generate a configuration from active channels.
-   Existing configurations require `fan-control --setup --yes` to replace them.
-4. Launch `fan-control`, label each active header, select temperature sources,
+1. Run `fantop --doctor` and resolve every failed prerequisite.
+2. Run `fantop --discover` and verify the detected controller and channels.
+3. Run `fantop --setup` to generate a configuration from active channels.
+   Existing configurations require `fantop --setup --yes` to replace them.
+4. Launch `fantop`, label each active header, select temperature sources,
    and review every curve.
 5. Save from the TUI. Saving requests sudo access, applies the curves immediately,
    and creates or updates the managed systemd timer or root cron fallback.
 6. Confirm that the footer shows green `SCHEDULE ACTIVE` and run
-   `fan-control --status` to verify temperatures, requested PWM, live PWM, and RPM.
+   `fantop --status` to verify temperatures, requested PWM, live PWM, and RPM.
 7. Test cooling under load before relying on unattended operation.
 
 To set the interval from the command line instead of the TUI:
 
 ```bash
-fan-control --schedule 5
-sudo fan-control --install-scheduler
+fantop --schedule 5
+sudo fantop --install-scheduler
 ```
 
 Supported intervals are 1, 2, 3, 5, 10, 15, 30, and 60 minutes.
@@ -119,23 +133,23 @@ Supported intervals are 1, 2, 3, 5, 10, 15, 30, and 60 minutes.
 ## Usage
 
 ```text
-fan-control                         interactive editor
-fan-control --status                current temperatures/PWM/RPM
-fan-control --doctor                prerequisite and hardware checks
-fan-control --discover              active controllable channels
-fan-control --discover --all-channels
-fan-control --setup                  configure active discovered channels
-fan-control --dry-run                calculate without writing PWM
-sudo fan-control --calibrate --yes   bounded PWM/RPM calibration
-sudo fan-control --restore-auto      restore firmware fan control
-fan-control --schedule 5            save a five-minute interval
-sudo fan-control --install-scheduler install systemd timer/cron fallback
-sudo fan-control --uninstall-scheduler remove managed scheduler
-fan-control --log-tail 50           show rotating log entries
-sudo fan-control --apply            apply once
+fantop                         interactive editor
+fantop --status                current temperatures/PWM/RPM
+fantop --doctor                prerequisite and hardware checks
+fantop --discover              active controllable channels
+fantop --discover --all-channels
+fantop --setup                  configure active discovered channels
+fantop --dry-run                calculate without writing PWM
+sudo fantop --calibrate --yes   bounded PWM/RPM calibration
+sudo fantop --restore-auto      restore firmware fan control
+fantop --schedule 5            save a five-minute interval
+sudo fantop --install-scheduler install systemd timer/cron fallback
+sudo fantop --uninstall-scheduler remove managed scheduler
+fantop --log-tail 50           show rotating log entries
+sudo fantop --apply            apply once
 ```
 
-In the TUI, use 1–4 or Tab to select, arrows and +/- to edit, A/D to add/delete,
+In the TUI, use 1–9 or Tab to select, arrows and +/- to edit, A/D to add/delete,
 M for step/linear mode, N to label a channel, C to cycle scheduler intervals,
 T to select a temperature source from the currently available sensors (with
 live temperatures shown),
@@ -151,6 +165,8 @@ clicked temperature and PWM. The Help control is available through `?`, F1, or
 either clickable `[? Help]` label; help remains open until the next key press.
 A bold yellow dotted vertical line marks the selected fan's current controlling
 sensor temperature on both its overview graph and the main editing graph.
+The selected PWM card uses a red border and red title; unselected cards remain
+cyan, making the curve currently being edited immediately visible.
 The bottom-right indicator flashes green when the exact managed systemd timer or
 cron fallback is active, or red when it is missing or out of date.
 PWM labels use a persistent Nano-style footer prompt reading
@@ -158,12 +174,14 @@ PWM labels use a persistent Nano-style footer prompt reading
 controls. Temperature-source changes remain unsaved until Save is selected.
 
 Configuration is versioned JSON at
-`INSTALL_DIR/.config/nam-fan-control/config.json`. With the recommended layout,
-that is `~/.local/share/fan-control-tui/.config/nam-fan-control/config.json`.
+`INSTALL_DIR/.config/fantop/config.json`. With the recommended layout,
+that is `~/.local/share/fantop/.config/fantop/config.json`.
+Existing settings from the former application name are migrated automatically
+on first launch and retained as a backup in their old location.
 Export opens a Nano-style name prompt in the bottom status area. Type an
 optional profile name, then use `Enter` to confirm or `Esc` to cancel. Named files use
-`INSTALL_DIR/FanExport_NAME_YYYYMMDD_HHMMSS.json` and retain the full label
-inside JSON; unnamed exports keep `INSTALL_DIR/FanExport_YYYYMMDD_HHMMSS.json`.
+`INSTALL_DIR/FantopExport_NAME_YYYYMMDD_HHMMSS.json` and retain the full label
+inside JSON; unnamed exports keep `INSTALL_DIR/FantopExport_YYYYMMDD_HHMMSS.json`.
 In the Import browser,
 press `N` to rename the selected profile and its file. The import rename field
 uses the same focused bottom-footer layout with explicit `Enter` confirmation

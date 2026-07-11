@@ -22,6 +22,6 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Compile Python
-        run: python -m py_compile fan_control.py
+        run: python -m py_compile fantop.py
       - name: Validate shell scripts
-        run: bash -n fan-control install.sh uninstall.sh
+        run: bash -n fantop install.sh uninstall.sh
