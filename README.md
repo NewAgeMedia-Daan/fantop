@@ -134,22 +134,22 @@ Supported intervals are 1, 2, 3, 5, 10, 15, 30, and 60 minutes.
 
 ## Usage
 
-```text
-fantop                         interactive editor
-fantop --status                current temperatures/PWM/RPM
-fantop --doctor                prerequisite and hardware checks
-fantop --discover              active controllable channels
-fantop --discover --all-channels
-fantop --setup                  configure active discovered channels
-fantop --dry-run                calculate without writing PWM
-sudo fantop --calibrate --yes   bounded PWM/RPM calibration
-sudo fantop --restore-auto      restore firmware fan control
-fantop --schedule 5            save a five-minute interval
-sudo fantop --install-scheduler install systemd timer/cron fallback
-sudo fantop --uninstall-scheduler remove managed scheduler
-fantop --log-tail 50           show rotating log entries
-sudo fantop --apply            apply once
-```
+| Command | Description |
+|---|---|
+| `fantop` | Open the interactive editor |
+| `fantop --status` | Show current temperatures, requested PWM, live PWM, and RPM |
+| `fantop --doctor` | Check prerequisites and available hardware support |
+| `fantop --discover` | List active controllable PWM channels |
+| `fantop --discover --all-channels` | List all controllable PWM channels, including inactive or zero-RPM headers |
+| `fantop --setup` | Configure active discovered channels |
+| `fantop --dry-run` | Calculate targets without writing PWM values |
+| `sudo fantop --calibrate --yes` | Run bounded PWM/RPM calibration |
+| `sudo fantop --restore-auto` | Restore firmware fan control |
+| `fantop --schedule 5` | Save a five-minute scheduler interval |
+| `sudo fantop --install-scheduler` | Install the systemd timer or cron fallback |
+| `sudo fantop --uninstall-scheduler` | Remove the managed scheduler |
+| `fantop --log-tail 50` | Show the last 50 rotating log entries |
+| `sudo fantop --apply` | Apply the saved curves once |
 
 ### TUI controls
 
