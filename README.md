@@ -8,6 +8,7 @@ smoothing, calibration, rotating logs, dynamic channel setup, and systemd-first
 scheduling with cron fallback.
 
 <img width="1918" height="972" alt="Screenshot 2026-07-11 233452" src="https://github.com/user-attachments/assets/83266428-944f-41f1-98b0-7dc3c5dc4756" />
+
 > [!CAUTION]
 > fantop writes directly to Linux hwmon PWM controls. Verify hardware,
 > sensors, and minimum safe speeds before enabling unattended operation.
