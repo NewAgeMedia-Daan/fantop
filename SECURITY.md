@@ -17,5 +17,4 @@ hardware damage, or data loss.
 - Test under sustained load while independently monitoring temperatures.
 - Keep a recovery path for restoring firmware/automatic fan control.
 
-No warranty is provided. Select and add an appropriate open-source license
-before publishing or accepting external contributions.
+No warranty is provided. See the MIT license for legal terms.

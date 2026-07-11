@@ -1,8 +1,10 @@
 # Fan Control TUI — BIOS-style fan curves in your terminal
 
 Lightweight Linux terminal fan-curve editor and controller using only Python's
-standard library, `lm-sensors`, Linux hwmon sysfs, and cron. It supports color,
+standard library, `lm-sensors`, Linux hwmon sysfs, and systemd or cron. It supports color,
 keyboard-only operation, and terminal mouse input.
+Version 3 adds fail-safe control, smoothing, calibration, rotating logs, dynamic
+channel setup, and systemd-first scheduling with cron fallback.
 
 > [!CAUTION]
 > Fan Control TUI writes directly to Linux hwmon PWM controls. Verify hardware,
@@ -14,6 +16,7 @@ keyboard-only operation, and terminal mouse input.
 - [Installation](#installation)
 - [First-time setup](#first-time-setup)
 - [Usage](#usage)
+- [Development and testing](#development-and-testing)
 - [Safety](#safety)
 
 ## System requirements and prerequisites
@@ -25,7 +28,7 @@ Fan Control TUI requires:
   recommended so inactive headers can be hidden and RPM can be monitored
 - Python 3.10 or newer with the standard `curses` module
 - `lm-sensors` for temperature discovery
-- `cron`/`crond` and `crontab` for automatic curve application
+- systemd (preferred) or `cron`/`crond` with `crontab` for automatic application
 - `sudo` or root access when switching PWM channels to manual mode and writing values
 - A color-capable terminal of at least 90 columns by 28 rows; mouse support is optional
 
@@ -63,18 +66,14 @@ separately as `python3-curses`.
 
 ## Installation
 
-Choose a stable installation directory. Cron stores the absolute path to
+Choose a stable installation directory. The managed scheduler stores the absolute path to
 `fan_control.py`, so do not move or delete that directory after enabling the
 schedule.
 
 From a downloaded or cloned source directory:
 
 ```bash
-install_dir="$HOME/.local/share/fan-control-tui"
-mkdir -p "$install_dir" "$HOME/.local/bin"
-cp fan_control.py fan-control README.md "$install_dir/"
-chmod +x "$install_dir/fan-control" "$install_dir/fan_control.py"
-ln -sfn "$install_dir/fan-control" "$HOME/.local/bin/fan-control"
+./install.sh
 ```
 
 Ensure `~/.local/bin` is on `PATH`, then verify the installation:
@@ -98,18 +97,21 @@ Discovery is read-only and does not change fan speeds.
 
 1. Run `fan-control --doctor` and resolve every failed prerequisite.
 2. Run `fan-control --discover` and verify the detected controller and channels.
-3. Launch `fan-control`, label each active header, and review every curve.
-4. Save from the TUI. Saving requests sudo access, applies the curves immediately,
-   and creates or updates the managed root crontab entry.
-5. Confirm that the footer shows green `CRON ACTIVE` and run
+3. Run `fan-control --setup` to generate a configuration from active channels.
+   Existing configurations require `fan-control --setup --yes` to replace them.
+4. Launch `fan-control`, label each active header, select temperature sources,
+   and review every curve.
+5. Save from the TUI. Saving requests sudo access, applies the curves immediately,
+   and creates or updates the managed systemd timer or root cron fallback.
+6. Confirm that the footer shows green `SCHEDULE ACTIVE` and run
    `fan-control --status` to verify temperatures, requested PWM, live PWM, and RPM.
-6. Test cooling under load before relying on unattended operation.
+7. Test cooling under load before relying on unattended operation.
 
 To set the interval from the command line instead of the TUI:
 
 ```bash
 fan-control --schedule 5
-sudo fan-control --install-cron
+sudo fan-control --install-scheduler
 ```
 
 Supported intervals are 1, 2, 3, 5, 10, 15, 30, and 60 minutes.
@@ -122,8 +124,14 @@ fan-control --status                current temperatures/PWM/RPM
 fan-control --doctor                prerequisite and hardware checks
 fan-control --discover              active controllable channels
 fan-control --discover --all-channels
+fan-control --setup                  configure active discovered channels
+fan-control --dry-run                calculate without writing PWM
+sudo fan-control --calibrate --yes   bounded PWM/RPM calibration
+sudo fan-control --restore-auto      restore firmware fan control
 fan-control --schedule 5            save a five-minute interval
-sudo fan-control --install-cron     install/update root scheduler
+sudo fan-control --install-scheduler install systemd timer/cron fallback
+sudo fan-control --uninstall-scheduler remove managed scheduler
+fan-control --log-tail 50           show rotating log entries
 sudo fan-control --apply            apply once
 ```
 
@@ -143,8 +151,8 @@ clicked temperature and PWM. The Help control is available through `?`, F1, or
 either clickable `[? Help]` label; help remains open until the next key press.
 A bold yellow dotted vertical line marks the selected fan's current controlling
 sensor temperature on both its overview graph and the main editing graph.
-The bottom-right indicator flashes green when the cron daemon and exact managed
-root schedule are active, or red when either is missing/out of date.
+The bottom-right indicator flashes green when the exact managed systemd timer or
+cron fallback is active, or red when it is missing or out of date.
 PWM labels use a persistent Nano-style footer prompt reading
 `Renaming / Labeling PWMN to:` with explicit Enter-confirm and Escape-cancel
 controls. Temperature-source changes remain unsaved until Save is selected.
@@ -169,3 +177,28 @@ Discovering channels is read-only. Applying switches configured channels to
 manual mode. Keep a firmware/BIOS fallback available and test curves under load.
 The default profile includes HDD and board-temperature airflow floors. Review
 and adapt every sensor mapping and safety threshold for the target hardware.
+If required temperatures cannot be read, configured channels are driven to the
+fail-safe PWM (255 by default). Upward fan changes are immediate; downward
+changes use configurable hysteresis and smoothing. Calibration always restores
+the original PWM values and enable modes in a `finally` path.
+The systemd service also has an `OnFailure` emergency unit that forces fail-safe
+PWM if the normal apply process crashes before its internal handler completes.
+Every normal PWM write is polled for asynchronous readback. Exact convergence
+or hardware-ramp movement is recorded; delayed mismatches are logged as warnings
+because some controllers ramp their readable register slowly. Controllers with
+immediate readback can opt into `strict_pwm_verification` in the JSON config.
+Write errors and strict-verification failures activate the emergency fail-safe.
+
+To uninstall safely, run `./uninstall.sh`; it offers to restore firmware control
+before removing the scheduler and application files.
+
+## Development and testing
+
+Run the complete local validation suite with:
+
+```bash
+make check
+```
+
+GitHub Actions runs unit tests on Python 3.10 and 3.12, compiles the application,
+and validates every shell entry point on pushes and pull requests.

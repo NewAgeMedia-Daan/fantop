@@ -6,9 +6,10 @@ Contributions are welcome through focused issues and pull requests.
 
 1. Use Linux with Python 3.10 or newer.
 2. Run `python3 -m py_compile fan_control.py`.
-3. Run `bash -n fan-control`.
-4. Use `./fan-control --doctor` and `./fan-control --discover` for read-only checks.
-5. Do not run `--apply` on unverified hardware.
+3. Run `bash -n fan-control install.sh uninstall.sh`.
+4. Run `python3 -m unittest discover -s tests -v`.
+5. Use `./fan-control --doctor`, `--discover`, and `--dry-run` for read-only checks.
+6. Do not run `--apply` or `--calibrate` on unverified hardware.
 
 ## Pull requests
 

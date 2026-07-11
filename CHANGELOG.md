@@ -2,6 +2,20 @@
 
 All notable changes to Fan Control TUI are documented here.
 
+## 3.0.0 - 2026-07-11
+
+### Added
+
+- Fail-safe PWM behavior for sensor and calculation failures
+- Downward hysteresis and smoothing with immediate heat-response ramp-up
+- Persistent controller state and rotating operational logs
+- Dynamic hwmon controller selection and active-channel setup
+- Bounded PWM/RPM calibration with automatic restoration
+- Firmware/automatic mode restore and scheduler uninstall commands
+- Systemd timer scheduling with automatic cron fallback
+- Confirmation prompts for destructive curve actions
+- Portable installer, uninstaller, MIT license, and automated unit tests
+
 ## 2.0.0 - 2026-07-11
 
 ### Added
