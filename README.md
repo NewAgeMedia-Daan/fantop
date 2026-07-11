@@ -151,45 +151,118 @@ fantop --log-tail 50           show rotating log entries
 sudo fantop --apply            apply once
 ```
 
-In the TUI, use 1–9 or Tab to select, arrows and +/- to edit, A/D to add/delete,
-M for step/linear mode, N to label a channel, C to cycle scheduler intervals,
-T to select a temperature source from the currently available sensors (with
-live temperatures shown),
-using the footer action `[T Temp Source]`,
-F to set every point in the selected curve to PWM 255, S to save/apply, E/I to
-export/import, ? for help, and Q or Ctrl+C to exit
-without saving. Bare Esc never exits the utility; it only cancels the active
-import, export, or rename dialog.
-Mouse selection, graph editing, and buttons work in terminals supporting mouse
-reporting. Right-click a yellow curve-point marker on the main editing graph to
-select it. Ctrl+right-click anywhere on that graph to insert a new point at the
-clicked temperature and PWM. The Help control is available through `?`, F1, or
-either clickable `[? Help]` label; help remains open until the next key press.
-A bold yellow dotted vertical line marks the selected fan's current controlling
-sensor temperature on both its overview graph and the main editing graph.
-The selected PWM card uses a red border and red title; unselected cards remain
-cyan, making the curve currently being edited immediately visible.
-The bottom-right indicator flashes green when the exact managed systemd timer or
-cron fallback is active, or red when it is missing or out of date.
-PWM labels use a persistent Nano-style footer prompt reading
-`Renaming / Labeling PWMN to:` with explicit Enter-confirm and Escape-cancel
-controls. Temperature-source changes remain unsaved until Save is selected.
+### TUI controls
 
-Configuration is versioned JSON at
-`INSTALL_DIR/.config/fantop/config.json`. With the recommended layout,
-that is `~/.local/share/fantop/.config/fantop/config.json`.
-Existing settings from the former application name are migrated automatically
-on first launch and retained as a backup in their old location.
-Export opens a Nano-style name prompt in the bottom status area. Type an
-optional profile name, then use `Enter` to confirm or `Esc` to cancel. Named files use
-`INSTALL_DIR/FantopExport_NAME_YYYYMMDD_HHMMSS.json` and retain the full label
-inside JSON; unnamed exports keep `INSTALL_DIR/FantopExport_YYYYMMDD_HHMMSS.json`.
-In the Import browser,
-press `N` to rename the selected profile and its file. The import rename field
-uses the same focused bottom-footer layout with explicit `Enter` confirmation
-and `Esc` cancellation while other actions are hidden. Invalid imports are
-rejected. Missing sensors or non-writable PWM controls fail closed without
-partially choosing fallback temperatures.
+#### Keyboard controls
+
+| Key | Action |
+|---|---|
+| `1`–`9` or `Tab` | Select a fan / PWM channel |
+| Arrow keys or `+` / `-` | Edit the selected curve point |
+| `A` / `D` | Add or delete a curve point |
+| `M` | Toggle between step and linear curve mode |
+| `N` | Rename / label the selected PWM channel |
+| `C` | Cycle scheduler intervals |
+| `T` or footer action `[T Temp Source]` | Select a temperature source from currently available sensors, with live temperatures shown |
+| `F` | Set every point in the selected curve to PWM `255` |
+| `S` | Save, apply immediately, and update the scheduler |
+| `E` / `I` | Export or import a profile |
+| `?` or `F1` | Open help |
+| `Q` or `Ctrl+C` | Exit without saving |
+
+`Esc` never exits the utility. It only cancels the currently active import,
+export, rename, or selection dialog.
+
+#### Mouse controls
+
+Mouse selection, graph editing, and footer buttons work in terminals that support
+mouse reporting.
+
+| Mouse action | Result |
+|---|---|
+| Left-click a fan card, table row, graph area, or footer button | Select or activate that item |
+| Right-click a yellow curve-point marker on the main editing graph | Select that curve point |
+| `Ctrl` + right-click anywhere on the main editing graph | Insert a new point at the clicked temperature and PWM |
+
+#### Help
+
+The help screen is available through `?`, `F1`, or either clickable `[? Help]`
+footer label. Help remains open until the next key press.
+
+#### Visual indicators
+
+A bold yellow dotted vertical line marks the selected fan's current controlling
+sensor temperature on both the overview graph and the main editing graph.
+
+The selected PWM card uses a red border and red title. Unselected cards remain
+cyan, making the curve currently being edited easy to identify.
+
+The bottom-right scheduler indicator flashes:
+
+| Color | Meaning |
+|---|---|
+| Green | The exact managed systemd timer or cron fallback is active |
+| Red | The scheduler is missing, inactive, or out of date |
+
+#### Rename and temperature-source dialogs
+
+PWM labels use a persistent Nano-style footer prompt:
+
+```text
+Renaming / Labeling PWMN to:
+```
+
+Use `Enter` to confirm or `Esc` to cancel.
+
+Temperature-source changes remain unsaved until `Save` is selected.
+
+### Configuration, profiles, and imports
+
+Configuration is stored as versioned JSON at:
+
+```text
+INSTALL_DIR/.config/fantop/config.json
+```
+
+With the recommended installation layout, this resolves to:
+
+```text
+~/.local/share/fantop/.config/fantop/config.json
+```
+
+Existing settings from the former application name are migrated automatically on
+first launch. The original configuration is retained as a backup in its old
+location.
+
+#### Exporting profiles
+
+Export opens a Nano-style name prompt in the bottom status area. Type an optional
+profile name, then press `Enter` to confirm or `Esc` to cancel.
+
+Named exports use this format:
+
+```text
+INSTALL_DIR/FantopExport_NAME_YYYYMMDD_HHMMSS.json
+```
+
+Unnamed exports use this format:
+
+```text
+INSTALL_DIR/FantopExport_YYYYMMDD_HHMMSS.json
+```
+
+Named profile exports retain the full label inside the JSON file.
+
+#### Importing profiles
+
+In the import browser, press `N` to rename the selected profile and its file.
+
+The import rename field uses the same focused bottom-footer layout, with explicit
+`Enter` confirmation and `Esc` cancellation. Other actions are hidden while the
+rename prompt is active.
+
+Invalid imports are rejected. Missing sensors or non-writable PWM controls fail
+closed without partially choosing fallback temperatures.
 
 ## Safety
 
