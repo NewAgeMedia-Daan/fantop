@@ -336,7 +336,7 @@ class FanTUI:
             curses.init_pair(2, curses.COLOR_GREEN, -1)
             curses.init_pair(3, curses.COLOR_YELLOW, -1)
             curses.init_pair(4, curses.COLOR_RED, -1)
-            curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_CYAN)
 
     def put(self, y: int, x: int, text: str, attr: int = 0, width: int | None = None) -> None:
         rows, columns = self.screen.getmaxyx()
@@ -463,12 +463,12 @@ class FanTUI:
         self.draw_cards(1, cards_h, columns)
         editor_y = 1 + cards_h
         self.draw_editor(editor_y, rows - editor_y - 3, columns)
-        buttons = "[S Save] [F Max] [C Schedule] [T Temp] [E Export] [I Import] [M Mode] [? Help] [Q Exit]"
+        buttons = "[S Save] [F Max] [C Schedule] [T Temp Source] [E Export] [I Import] [M] [? Help] [Q Exit]"
         self.put(rows - 2, 0, buttons, curses.color_pair(1) | curses.A_BOLD, columns - 1)
         cursor = 0
         for action, label in (("save", "[S Save]"), ("max", "[F Max]"),
-                              ("schedule", "[C Schedule]"), ("temp", "[T Temp]"), ("export", "[E Export]"),
-                              ("import", "[I Import]"), ("mode", "[M Mode]"),
+                              ("schedule", "[C Schedule]"), ("temp", "[T Temp Source]"), ("export", "[E Export]"),
+                              ("import", "[I Import]"), ("mode", "[M]"),
                               ("help", "[? Help]"), ("exit", "[Q Exit]")):
             pos = buttons.find(label, cursor); cursor = pos + len(label)
             self.regions.append((rows - 2, pos, rows - 2, cursor - 1, action, 0))

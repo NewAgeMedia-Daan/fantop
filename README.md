@@ -131,6 +131,7 @@ In the TUI, use 1–4 or Tab to select, arrows and +/- to edit, A/D to add/delet
 M for step/linear mode, N to label a channel, C to cycle scheduler intervals,
 T to select a temperature source from the currently available sensors (with
 live temperatures shown),
+using the footer action `[T Temp Source]`,
 F to set every point in the selected curve to PWM 255, S to save/apply, E/I to
 export/import, ? for help, and Q or Ctrl+C to exit
 without saving. Bare Esc never exits the utility; it only cancels the active
