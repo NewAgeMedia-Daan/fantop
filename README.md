@@ -1,4 +1,4 @@
-# fantop — BIOS-style fan curves in your terminal
+# fantop — BIOS-style fan curves in your terminal for Linux
 
 Lightweight Linux terminal fan-curve editor and controller using only Python's
 standard library, `lm-sensors`, Linux hwmon sysfs, and systemd or cron. It supports color,
