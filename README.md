@@ -1,3 +1,7 @@
+<img width="1382" height="310"" alt="Fantop - BIOS-style fan curves in your terminal for Linux" src="https://github.com/user-attachments/assets/7eb6aa47-d34c-47ff-9fa8-2549dbc5c887" />
+
+
+
 # fantop — BIOS-style fan curves in your terminal for Linux
 
 Lightweight Linux terminal fan-curve editor and controller using only Python's
