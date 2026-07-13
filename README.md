@@ -1,6 +1,4 @@
-<img width="1382" height="310" style="background-color:red!important" alt="Fantop - BIOS-style fan curves in your terminal for Linux" src="https://github.com/user-attachments/assets/4616fd8a-97ed-4448-a682-9c0a78b35abc" />
-
-
+<img src="/NewAgeMedia-Daan/fantop/raw/main/img/Fantop - BIOS-style fan curves in your terminal for Linux.png" alt="Fantop - BIOS-style fan curves in your terminal for Linux" style="max-width: 100%;">
 
 
 # fantop — BIOS-style fan curves in your terminal for Linux
