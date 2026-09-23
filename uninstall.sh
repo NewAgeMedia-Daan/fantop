@@ -22,6 +22,7 @@ fi
 "${ROOT_CMD[@]}" rm -f "$SYSTEM_DIR/fantop.py"
 "${ROOT_CMD[@]}" rmdir "$SYSTEM_DIR" 2>/dev/null || true
 "${ROOT_CMD[@]}" rm -f /var/lib/fantop/state.json
+"${ROOT_CMD[@]}" rm -f /var/lib/fantop/recovery-config.json
 "${ROOT_CMD[@]}" rm -f /var/lib/fantop/fantop.log /var/lib/fantop/fantop.log.[0-9]*
 "${ROOT_CMD[@]}" rmdir /var/lib/fantop 2>/dev/null || true
 rm -rf "$INSTALL_DIR"

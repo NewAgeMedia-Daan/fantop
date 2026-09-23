@@ -102,7 +102,8 @@ fantop --discover
 The installer creates a user launcher at `~/.local/bin/fantop` and a protected
 system launcher at `/usr/local/bin/fantop`, so `fantop` and `sudo fantop` work
 from any directory. It also migrates legacy configurations, removes the previous
-launcher name, and updates an existing managed schedule.
+launcher name, and updates an existing managed schedule. It stores a protected
+copy of the last applied configuration at `/var/lib/fantop/recovery-config.json`.
 
 `--discover` shows active channels with tachometer feedback. To diagnose all
 PWM headers, including unused or zero-RPM channels, run:
@@ -158,6 +159,14 @@ scheduler fails with an error instead of silently selecting another one.
 | `sudo fantop --uninstall-scheduler` | Remove the managed scheduler |
 | `fantop --log-tail 50` | Show the last 50 rotating log entries |
 | `sudo fantop --apply` | Apply the saved curves once |
+| `sudo fantop --fail-safe` | Force configured channels to full speed using the protected recovery config |
+
+If the editable configuration is malformed or missing, scheduled application
+sets the previously configured channels to PWM 255 and reports an error. The
+emergency command uses the protected recovery copy even when the editable file
+cannot be read. A fan with calibration data and zero RPM receives a startup
+pulse; fantop raises it to PWM 255 if necessary and reports a failure if RPM
+does not appear. Keep fan tachometer feedback connected for this check.
 
 ### TUI controls
 

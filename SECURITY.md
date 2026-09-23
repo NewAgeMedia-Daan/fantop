@@ -20,5 +20,8 @@ hardware damage, or data loss.
   inaccessible for writing by other users; the scheduler refuses unsafe paths.
 - Configured controller paths are accepted only when they resolve to a device
   listed under `/sys/class/hwmon`.
+- Keep `/var/lib/fantop/recovery-config.json` root-owned and unwritable by other
+  users. The emergency command uses this last applied copy if the editable
+  configuration is damaged.
 
 No warranty is provided. See the MIT license for legal terms.

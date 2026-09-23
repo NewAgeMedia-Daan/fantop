@@ -28,6 +28,7 @@ SYSTEM_LAUNCHER = Path("/usr/local/bin/fantop")
 USER_HOME = Path(os.environ.get("FANTOP_DATA_DIR", str(SCRIPT.parent))).resolve()
 CONFIG_FILE = USER_HOME / ".config" / "fantop" / "config.json"
 STATE_FILE = Path("/var/lib/fantop/state.json")
+RECOVERY_CONFIG_FILE = STATE_FILE.parent / "recovery-config.json"
 LOG_FILE = Path("/var/lib/fantop/fantop.log")
 LOCK_FILE = Path("/run/fantop.lock")
 CRON_MARKER = "# fantop (managed; do not edit)"
@@ -36,7 +37,7 @@ LEGACY_CRON_MARKERS = ("# fan-control-tui (managed; do not edit)",
 LEGACY_CONFIG_DIRS = (USER_HOME / ".config" / "nam-fan-control",
                       USER_HOME.parent / "fan-control-tui" / ".config" / "nam-fan-control",
                       Path.home() / ".config" / "nam-fan-control")
-APP_VERSION = "4.0.2"
+APP_VERSION = "4.0.3"
 SENSOR_TIMEOUT_SECONDS = 5
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -108,8 +109,8 @@ def validate_config(data: Any) -> dict[str, Any]:
         raise ValueError("scheduler must be auto, systemd, or cron")
     control = data.setdefault("control", {})
     for key, value in DEFAULT_CONFIG["control"].items(): control.setdefault(key, value)
-    if not 0 <= control.get("fail_safe_pwm", -1) <= 255:
-        raise ValueError("fail_safe_pwm must be 0-255")
+    if control.get("fail_safe_pwm") != 255:
+        raise ValueError("fail_safe_pwm must be 255")
     if not 0 <= control.get("hysteresis_c", -1) <= 20:
         raise ValueError("hysteresis_c must be 0-20")
     if not 0 < control.get("smoothing_alpha", 0) <= 1:
@@ -125,6 +126,14 @@ def validate_config(data: Any) -> dict[str, Any]:
             raise ValueError(f"Invalid PWM channel for {fan.get('id')}")
         if fan["pwm"] in pwm_channels: raise ValueError("PWM channels must be unique")
         pwm_channels.add(fan["pwm"])
+        if not isinstance(fan.get("fan_input", fan["pwm"]), int) or fan.get("fan_input", fan["pwm"]) not in range(1, 33):
+            raise ValueError(f"Invalid fan input for {fan.get('id')}")
+        calibration = fan.get("calibration", {})
+        if not isinstance(calibration, dict): raise ValueError("calibration must be an object")
+        for key in ("minimum_pwm", "startup_pwm"):
+            value = calibration.get(key)
+            if value is not None and (not isinstance(value, int) or not 0 <= value <= 255):
+                raise ValueError(f"Invalid {key} for {fan.get('id')}")
         if fan.get("sensor") not in {"cpu", "hdd", "system", "vrm", "pch", "board", "case"}:
             raise ValueError(f"Invalid sensor source for {fan.get('id')}")
         points = fan.get("points")
@@ -203,6 +212,22 @@ def atomic_save(data: dict[str, Any], path: Path | None = None) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def load_recovery_config() -> dict[str, Any]:
+    details = RECOVERY_CONFIG_FILE.lstat()
+    if not stat.S_ISREG(details.st_mode) or details.st_uid != 0 or details.st_mode & 0o022:
+        raise RuntimeError("Recovery config is not protected")
+    with RECOVERY_CONFIG_FILE.open(encoding="utf-8") as handle:
+        return validate_config(json.load(handle))
+
+
+def save_recovery_config(config: dict[str, Any]) -> None:
+    if os.geteuid() != 0 or SCRIPT != SYSTEM_SCRIPT:
+        raise PermissionError("Recovery config requires the protected system launcher")
+    verify_root_runtime()
+    atomic_save(config, RECOVERY_CONFIG_FILE)
+    os.chmod(RECOVERY_CONFIG_FILE, 0o600)
 
 
 def load_state() -> dict[str, Any]:
@@ -374,7 +399,25 @@ def read_live(config: dict[str, Any]) -> tuple[dict[str, float], dict[str, int],
     return temps, pwms, rpms, overrides
 
 
-def apply_config(config: dict[str, Any], quiet: bool = False) -> bool:
+def ensure_fan_started(hwmon: Path, fan: dict[str, Any], target: int) -> None:
+    startup = fan.get("calibration", {}).get("startup_pwm")
+    if startup is None or target == 0:
+        return
+    tach = hwmon / f"fan{fan.get('fan_input', fan['pwm'])}_input"
+    if int(tach.read_text()) > 0:
+        return
+    pulse = max(target, int(startup))
+    for value in dict.fromkeys((pulse, 255)):
+        write_pwm_verified(hwmon, fan["pwm"], value, strict=True)
+        for _ in range(10):
+            time.sleep(0.5)
+            if int(tach.read_text()) > 0:
+                return
+    raise RuntimeError(f"PWM{fan['pwm']} fan did not start at full speed")
+
+
+def apply_config(config: dict[str, Any], quiet: bool = False,
+                 record_recovery: bool = True) -> bool:
     lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
     try:
         try:
@@ -398,7 +441,7 @@ def apply_config(config: dict[str, Any], quiet: bool = False) -> bool:
             values = stabilize_pwms(config, temps, targets, load_state())
         except Exception as exc:
             sensor_error = exc
-            fail_safe = int(config.get("control", {}).get("fail_safe_pwm", 255))
+            fail_safe = 255
             values = {fan["id"]: fail_safe for fan in config["fans"] if fan.get("enabled", True)}
             temps, overrides = {}, [f"FAIL-SAFE: {exc}"]
             logger.error("fail-safe PWM=%s reason=%s", fail_safe, exc)
@@ -408,7 +451,10 @@ def apply_config(config: dict[str, Any], quiet: bool = False) -> bool:
             if not fan.get("enabled", True): continue
             pwm = fan["pwm"]
             try:
+                if sensor_error is None:
+                    ensure_fan_started(hwmon, fan, values[fan["id"]])
                 actual = write_pwm_verified(hwmon, pwm, values[fan["id"]],
+                                            sensor_error is not None or
                                             bool(config["control"].get("strict_pwm_verification", False)))
                 observed[fan["id"]] = actual
                 if actual != values[fan["id"]]:
@@ -422,6 +468,14 @@ def apply_config(config: dict[str, Any], quiet: bool = False) -> bool:
                                ("; fail-safe errors: " + "; ".join(recovery_errors) if recovery_errors else ""))
         if sensor_error is not None:
             raise RuntimeError(f"Sensor failure; fail-safe PWM applied: {sensor_error}") from sensor_error
+        if record_recovery and SCRIPT == SYSTEM_SCRIPT and os.geteuid() == 0:
+            try:
+                save_recovery_config(config)
+            except Exception as exc:
+                recovery_errors = write_fail_safe(hwmon, config)
+                logger.critical("Recovery config save failure=%s; fail-safe errors=%s", exc, recovery_errors)
+                raise RuntimeError(f"Recovery config could not be saved: {exc}" +
+                                   ("; fail-safe errors: " + "; ".join(recovery_errors) if recovery_errors else "")) from exc
         save_state(temps, observed)
         logger.info("temps=%s pwm=%s overrides=%s", temps, values, overrides)
         if not quiet:
@@ -436,7 +490,7 @@ def apply_config(config: dict[str, Any], quiet: bool = False) -> bool:
 
 
 def write_fail_safe(hwmon: Path, config: dict[str, Any]) -> list[str]:
-    value = int(config.get("control", {}).get("fail_safe_pwm", 255))
+    value = 255
     errors: list[str] = []
     for fan in config["fans"]:
         if not fan.get("enabled", True): continue
@@ -449,8 +503,13 @@ def write_fail_safe(hwmon: Path, config: dict[str, Any]) -> list[str]:
 
 
 def force_fail_safe(config: dict[str, Any]) -> None:
-    hwmon = find_hwmon(config); value = int(config.get("control", {}).get("fail_safe_pwm", 255))
-    errors = write_fail_safe(hwmon, config)
+    lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        hwmon = find_hwmon(config); value = 255
+        errors = write_fail_safe(hwmon, config)
+    finally:
+        os.close(lock_fd)
     try: get_logger(config).critical("forced fail-safe PWM=%s errors=%s", value, errors)
     except OSError as exc: print(f"Fail-safe log unavailable: {exc}", file=sys.stderr)
     if errors: raise RuntimeError("Fail-safe write errors: " + "; ".join(errors))
@@ -470,15 +529,22 @@ def write_pwm_verified(hwmon: Path, number: int, value: int, strict: bool = Fals
     previous = initial
     for _ in range(2):
         pwm_path.write_text(f"{value}\n")
+        progress = 0
+        stalled = 0
         for _ in range(10):
             time.sleep(0.1); actual = int(pwm_path.read_text())
             if actual == value: return actual
             if (value - initial) * (actual - previous) > 0 and abs(value - actual) < abs(value - initial):
                 progress += 1
+                stalled = 0
             elif (value - initial) * (actual - previous) < 0:
                 progress = 0
+                stalled += 1
+            else:
+                stalled += 1
             previous = actual
-        if progress >= 2 and abs(value - actual) < abs(value - initial) and not strict: return actual
+        if progress >= 2 and stalled < 4 and abs(value - actual) < abs(value - initial) and not strict:
+            return actual
     raise RuntimeError(f"PWM{number} write verification failed: requested {value}, read {actual}")
 
 
@@ -594,9 +660,10 @@ def activate_config(path: Path) -> None:
         raise RuntimeError("Activation must use the protected system launcher")
     with path.open(encoding="utf-8") as handle:
         candidate = validate_config(json.load(handle))
-    if not apply_config(candidate):
+    if not apply_config(candidate, record_recovery=False):
         raise RuntimeError("Fan control is already running; configuration was not activated")
     install_scheduler(candidate)
+    save_recovery_config(candidate)
     atomic_save(candidate)
     if os.geteuid() == 0 and path.stat().st_uid != 0:
         os.chown(CONFIG_FILE, path.stat().st_uid, path.stat().st_gid)
@@ -1310,6 +1377,7 @@ def main() -> int:
     parser.add_argument("--install-cron", action="store_true", help="install cron fallback scheduler")
     parser.add_argument("--install-scheduler", action="store_true", help="install systemd timer or cron fallback")
     parser.add_argument("--activate-config", type=Path, metavar="FILE", help=argparse.SUPPRESS)
+    parser.add_argument("--sync-recovery-config", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--uninstall-scheduler", action="store_true", help="remove managed systemd/cron scheduler")
     parser.add_argument("--restore-auto", action="store_true", help="restore firmware/automatic PWM mode")
     parser.add_argument("--setup", action="store_true", help="create config from active discovered channels")
@@ -1326,18 +1394,46 @@ def main() -> int:
     parser.add_argument("--version", action="version", version=f"fantop {APP_VERSION}")
     args = parser.parse_args()
     try:
+        if args.sync_recovery_config:
+            if not RECOVERY_CONFIG_FILE.exists():
+                if not CONFIG_FILE.is_file(): raise RuntimeError("No saved config to recover")
+                save_recovery_config(load_config())
+            else:
+                load_recovery_config()
+            return 0
+        if args.activate_config:
+            activate_config(args.activate_config)
+            return 0
+        if args.fail_safe:
+            try:
+                recovery = load_recovery_config()
+            except FileNotFoundError:
+                if not CONFIG_FILE.is_file(): raise RuntimeError("No saved config to recover")
+                recovery = load_config()
+            force_fail_safe(recovery)
+            return 0
+        if args.apply:
+            try:
+                if not CONFIG_FILE.is_file(): raise RuntimeError("Saved config is missing")
+                config = load_config()
+            except Exception as exc:
+                recovery = load_recovery_config()
+                force_fail_safe(recovery)
+                raise RuntimeError(f"Invalid saved config; fail-safe PWM applied: {exc}") from exc
+            apply_config(config)
+            return 0
         config = load_config()
-        if args.activate_config: activate_config(args.activate_config)
         if args.setup: config = setup_from_discovery(config, args.yes)
         if args.init_config and not CONFIG_FILE.exists(): atomic_save(config); print(f"Created {CONFIG_FILE}")
         if args.schedule: config["schedule_minutes"] = args.schedule; atomic_save(config)
+        if args.install_cron or args.install_scheduler:
+            if not CONFIG_FILE.is_file(): raise RuntimeError("Save a config before installing the scheduler")
+            save_recovery_config(config)
         if args.install_cron: install_cron(config)
         if args.install_scheduler: install_scheduler(config)
         if args.uninstall_scheduler: uninstall_scheduler()
         if args.restore_auto: restore_auto(config)
         if args.calibrate: calibrate(config, args.yes)
-        if args.apply: apply_config(config)
-        if args.fail_safe: force_fail_safe(config)
         if args.status: print_status(config)
         if args.dry_run: print_dry_run(config)
         if args.log_tail:
@@ -1353,7 +1449,7 @@ def main() -> int:
                 for channel in controller['channels']:
                     state = "active" if channel['active'] else "inactive"
                     print(f"  PWM{channel['pwm']}: {state}, RPM={channel['rpm']}, writable={channel['writable']}")
-        actions = (args.activate_config, args.apply, args.fail_safe, args.install_cron, args.install_scheduler, args.uninstall_scheduler,
+        actions = (args.activate_config, args.sync_recovery_config, args.apply, args.fail_safe, args.install_cron, args.install_scheduler, args.uninstall_scheduler,
                    args.restore_auto, args.setup, args.calibrate, args.status, args.dry_run,
                    args.log_tail, args.init_config, args.doctor, args.discover, args.schedule)
         if not any(actions): run_tui(config)

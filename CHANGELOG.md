@@ -2,6 +2,22 @@
 
 All notable changes to fantop are documented here.
 
+## 4.0.3 - 2026-09-23
+
+### Fixed
+
+- Keep a protected copy of the last applied configuration so malformed or missing
+  editable configuration triggers full-speed recovery during scheduled runs and
+  does not block the emergency command
+- Require full-speed PWM 255 for every fail-safe path and verify sensor-failure
+  writes strictly
+- Reject PWM ramps that make early progress and then stall below the target
+- Use calibrated startup PWM when a fan is stopped, escalate to full speed if
+  needed, and require RPM feedback before returning to the curve target
+- Validate configured fan input and calibration PWM values
+- Initialize protected recovery data during direct scheduler installation,
+  serialize emergency writes with normal control, and clean it up on uninstall
+
 ## 4.0.2 - 2026-09-23
 
 ### Fixed

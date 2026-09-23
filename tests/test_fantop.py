@@ -74,6 +74,24 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fantop.validate_config(config)
 
+    def test_fail_safe_pwm_must_be_full_speed(self):
+        for value in (0, 128, 254):
+            config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+            config["control"]["fail_safe_pwm"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "must be 255"):
+                fantop.validate_config(config)
+
+    def test_recovery_config_is_saved_with_private_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recovery = Path(directory) / "recovery.json"
+            with mock.patch.object(fantop, "RECOVERY_CONFIG_FILE", recovery), \
+                 mock.patch.object(fantop, "SCRIPT", fantop.SYSTEM_SCRIPT), \
+                 mock.patch.object(fantop, "verify_root_runtime"), \
+                 mock.patch("os.geteuid", return_value=0):
+                fantop.save_recovery_config(copy.deepcopy(fantop.DEFAULT_CONFIG))
+            self.assertEqual(recovery.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(__import__("json").loads(recovery.read_text())["control"]["fail_safe_pwm"], 255)
+
     def test_duplicate_pwm_rejected(self):
         config = copy.deepcopy(fantop.DEFAULT_CONFIG)
         config["fans"][1]["pwm"] = config["fans"][0]["pwm"]
@@ -131,6 +149,49 @@ class StabilityTests(unittest.TestCase):
 
 
 class FailSafeTests(unittest.TestCase):
+    def test_malformed_config_forces_recovery_on_apply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bad_config = Path(directory) / "config.json"
+            bad_config.write_text("{broken")
+            with mock.patch.object(fantop, "CONFIG_FILE", bad_config), \
+                 mock.patch.object(fantop, "load_recovery_config", return_value=copy.deepcopy(fantop.DEFAULT_CONFIG)), \
+                 mock.patch.object(fantop, "force_fail_safe") as recover, \
+                 mock.patch("sys.argv", ["fantop", "--apply"]):
+                self.assertEqual(fantop.main(), 1)
+            recover.assert_called_once()
+
+    def test_fail_safe_uses_recovery_when_live_config_is_malformed(self):
+        with mock.patch.object(fantop, "load_recovery_config", return_value=copy.deepcopy(fantop.DEFAULT_CONFIG)), \
+             mock.patch.object(fantop, "load_config", side_effect=AssertionError("live config read")), \
+             mock.patch.object(fantop, "force_fail_safe") as recover, \
+             mock.patch("sys.argv", ["fantop", "--fail-safe"]):
+            self.assertEqual(fantop.main(), 0)
+        recover.assert_called_once()
+
+    def test_stopped_calibrated_fan_gets_startup_then_full_speed(self):
+        fan = {"pwm": 1, "fan_input": 1, "calibration": {"startup_pwm": 40}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tach = root / "fan1_input"
+            tach.write_text("0\n")
+            def write(_, __, value, strict=False):
+                if value == 255: tach.write_text("800\n")
+                return value
+            with mock.patch.object(fantop, "write_pwm_verified", side_effect=write) as pwm, \
+                 mock.patch("time.sleep"):
+                fantop.ensure_fan_started(root, fan, 80)
+            self.assertEqual([call.args[2] for call in pwm.call_args_list], [80, 255])
+
+    def test_stopped_fan_without_rpm_is_rejected(self):
+        fan = {"pwm": 1, "fan_input": 1, "calibration": {"startup_pwm": 40}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "fan1_input").write_text("0\n")
+            with mock.patch.object(fantop, "write_pwm_verified", return_value=255), \
+                 mock.patch("time.sleep"), \
+                 self.assertRaisesRegex(RuntimeError, "did not start"):
+                fantop.ensure_fan_started(root, fan, 80)
+
     def test_sensor_command_has_timeout(self):
         import subprocess
         with mock.patch.object(fantop.subprocess, "run",
@@ -163,6 +224,20 @@ class FailSafeTests(unittest.TestCase):
                     fantop.apply_config(config, quiet=True)
             self.assertEqual((root / "pwm1").read_text().strip(), "255")
             self.assertEqual((root / "pwm1_enable").read_text().strip(), "1")
+
+    def test_sensor_failure_requires_exact_fail_safe_readback(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["fans"] = config["fans"][:1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(fantop, "LOCK_FILE", root / "lock"), \
+                 mock.patch.object(fantop, "find_hwmon", return_value=root), \
+                 mock.patch.object(fantop, "read_sensors", side_effect=RuntimeError("sensor offline")), \
+                 mock.patch.object(fantop, "get_logger", return_value=mock.Mock()), \
+                 mock.patch.object(fantop, "write_pwm_verified", return_value=255) as write, \
+                 self.assertRaisesRegex(RuntimeError, "Sensor failure"):
+                fantop.apply_config(config, quiet=True)
+            write.assert_called_once_with(root, 1, 255, True)
 
     def test_failed_channel_recovers_all_channels(self):
         config = copy.deepcopy(fantop.DEFAULT_CONFIG)
@@ -214,6 +289,20 @@ class FailSafeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "verification failed"):
                     fantop.write_pwm_verified(root, 1, 173)
 
+    def test_stalled_partial_ramp_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pwm1").write_text("80\n")
+            (root / "pwm1_enable").write_text("1\n")
+            readings = iter([80, 90, 100] + [100] * 20)
+            original_read = Path.read_text
+            def read(path, *args, **kwargs):
+                return f"{next(readings)}\n" if path.name == "pwm1" else original_read(path, *args, **kwargs)
+            with mock.patch("os.access", return_value=True), mock.patch("time.sleep"), \
+                 mock.patch.object(Path, "read_text", autospec=True, side_effect=read), \
+                 self.assertRaisesRegex(RuntimeError, "verification failed"):
+                fantop.write_pwm_verified(root, 1, 200)
+
     def test_manual_mode_must_be_accepted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -239,6 +328,18 @@ class FailSafeTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_direct_scheduler_install_saves_recovery_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(__import__("json").dumps(fantop.DEFAULT_CONFIG))
+            with mock.patch.object(fantop, "CONFIG_FILE", config_path), \
+                 mock.patch.object(fantop, "save_recovery_config") as recovery, \
+                 mock.patch.object(fantop, "install_scheduler") as scheduler, \
+                 mock.patch("sys.argv", ["fantop", "--install-scheduler"]):
+                self.assertEqual(fantop.main(), 0)
+            recovery.assert_called_once()
+            scheduler.assert_called_once()
+
     def test_systemd_install_completes_after_enabling_timer(self):
         config = copy.deepcopy(fantop.DEFAULT_CONFIG)
         with mock.patch("os.geteuid", return_value=0), \

@@ -35,6 +35,9 @@ trap 'rm -f "$LAUNCHER_TEMP"' EXIT
 printf '#!/bin/bash\n# fantop system launcher (managed)\nset -euo pipefail\nexport FANTOP_DATA_DIR=%q\nexec /usr/bin/python3 %q "$@"\n' "$INSTALL_DIR" "$SYSTEM_SCRIPT" > "$LAUNCHER_TEMP"
 "${ROOT_CMD[@]}" install -m 755 "$LAUNCHER_TEMP" "$SYSTEM_LAUNCHER.new"
 "${ROOT_CMD[@]}" mv -Tf "$SYSTEM_LAUNCHER.new" "$SYSTEM_LAUNCHER"
+if [[ -f "$INSTALL_DIR/.config/fantop/config.json" ]]; then
+  "${ROOT_CMD[@]}" "$SYSTEM_LAUNCHER" --sync-recovery-config
+fi
 if { command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet fantop.timer; } ||
    "${ROOT_CMD[@]}" crontab -l 2>/dev/null | grep -Fx '# fantop (managed; do not edit)' >/dev/null; then
   "${ROOT_CMD[@]}" "$SYSTEM_LAUNCHER" --install-scheduler
