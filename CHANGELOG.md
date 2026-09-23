@@ -2,6 +2,19 @@
 
 All notable changes to fantop are documented here.
 
+## 4.0.2 - 2026-09-23
+
+### Fixed
+
+- Run scheduled control from a verified root-owned launcher and runtime
+- Restrict configured controller paths to devices discovered by Linux hwmon
+- Keep controller state and logs in root-owned directories
+- Time out stalled sensor reads so normal fail-safe handling can run
+- Verify manual mode and emergency PWM readback, reporting channels that did not reach the target
+- Preserve unrelated root cron entries and refuse ambiguous crontab read failures
+- Require sensors referenced by active safety rules
+- Repoint existing managed schedules during installation upgrades
+
 ## 4.0.1 - 2026-09-23
 
 ### Fixed

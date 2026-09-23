@@ -72,9 +72,10 @@ separately as `python3-curses`.
 
 ## Installation
 
-Choose a stable installation directory. The managed scheduler stores the absolute path to
-`fantop.py`, so do not move or delete that directory after enabling the
-schedule.
+Choose a stable installation directory. The installer places the interactive
+copy there and installs a root-owned controller at
+`/usr/local/lib/fantop/fantop.py`. The managed scheduler uses the protected
+`/usr/local/bin/fantop` launcher. Installation needs sudo access.
 
 Clone and install the latest release:
 
@@ -98,10 +99,10 @@ fantop --doctor
 fantop --discover
 ```
 
-The installer creates both `~/.local/bin/fantop` and `/usr/local/bin/fantop`, so
-the utility can be launched as `fantop` from any working directory and remains
-available through `sudo fantop`. It also migrates legacy configurations and
-removes the previous launcher name.
+The installer creates a user launcher at `~/.local/bin/fantop` and a protected
+system launcher at `/usr/local/bin/fantop`, so `fantop` and `sudo fantop` work
+from any directory. It also migrates legacy configurations, removes the previous
+launcher name, and updates an existing managed schedule.
 
 `--discover` shows active channels with tachometer feedback. To diagnose all
 PWM headers, including unused or zero-RPM channels, run:
@@ -279,8 +280,11 @@ The default profile includes HDD and board-temperature airflow floors. Review
 and adapt every sensor mapping and safety threshold for the target hardware.
 If required temperatures cannot be read, configured channels are driven to the
 fail-safe PWM (255 by default), and the apply command exits with an error.
+Sensor reads time out after five seconds. Sensors used by active safety rules
+are required even when their dedicated fan group is disabled.
 If a PWM write fails, fantop attempts fail-safe writes on every configured
-channel and reports any recovery failures. An unchanged PWM readback counts as
+channel and verifies manual mode and exact PWM readback for each emergency write. It reports
+any recovery failures. An unchanged PWM readback counts as
 a failed write; a progressing hardware ramp is accepted unless strict PWM
 verification is enabled. Upward fan changes are immediate; downward
 changes use configurable hysteresis and smoothing. Calibration attempts to restore
@@ -293,6 +297,12 @@ or repeated movement toward the target is recorded. Controllers with immediate
 readback can opt into `strict_pwm_verification` in the JSON config, which
 requires exact convergence. Persistent mismatches activate the emergency
 fail-safe.
+The scheduled controller code, launcher, state, and logs live in root-owned
+directories. The editable configuration remains at
+`INSTALL_DIR/.config/fantop/config.json`; state is stored in
+`/var/lib/fantop/state.json` and logs in `/var/lib/fantop/fantop.log`.
+Upgrades leave older state and log files in the previous installation directory;
+new state is recorded after the next successful scheduled run.
 
 To uninstall safely, run `./uninstall.sh`; it offers to restore firmware control
 before removing the scheduler and application files.

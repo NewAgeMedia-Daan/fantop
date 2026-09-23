@@ -16,5 +16,9 @@ hardware damage, or data loss.
 - Keep firmware fan protection enabled where possible.
 - Test under sustained load while independently monitoring temperatures.
 - Keep a recovery path for restoring firmware/automatic fan control.
+- Keep `/usr/local/bin/fantop` and `/usr/local/lib/fantop` root-owned and
+  inaccessible for writing by other users; the scheduler refuses unsafe paths.
+- Configured controller paths are accepted only when they resolve to a device
+  listed under `/sys/class/hwmon`.
 
 No warranty is provided. See the MIT license for legal terms.

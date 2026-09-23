@@ -4,7 +4,10 @@ set -euo pipefail
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${FANTOP_INSTALL_DIR:-$HOME/.local/share/fantop}"
 BIN_DIR="${FANTOP_BIN_DIR:-$HOME/.local/bin}"
-SYSTEM_LAUNCHER="${FANTOP_SYSTEM_LAUNCHER:-/usr/local/bin/fantop}"
+SYSTEM_DIR="/usr/local/lib/fantop"
+SYSTEM_SCRIPT="$SYSTEM_DIR/fantop.py"
+SYSTEM_LAUNCHER="/usr/local/bin/fantop"
+if [[ $EUID -eq 0 ]]; then ROOT_CMD=(); else ROOT_CMD=(sudo); fi
 
 mkdir -p "$INSTALL_DIR" "$BIN_DIR"
 LEGACY_DIR="$HOME/.local/share/fan-control-tui"
@@ -23,14 +26,18 @@ mv -f "$INSTALL_DIR/.fantop.new" "$INSTALL_DIR/fantop"
 install -m 644 "$SOURCE_DIR/README.md" "$INSTALL_DIR/README.md"
 ln -sfn "$INSTALL_DIR/fantop" "$BIN_DIR/fantop"
 rm -f "$BIN_DIR/fan-control"
-if [[ -L "$SYSTEM_LAUNCHER" && "$(readlink -f -- "$SYSTEM_LAUNCHER")" == "$INSTALL_DIR/fantop" ]]; then
-  :
-elif [[ -w "$(dirname -- "$SYSTEM_LAUNCHER")" ]]; then
-  ln -sfn "$INSTALL_DIR/fantop" "$SYSTEM_LAUNCHER"
-elif command -v sudo >/dev/null 2>&1; then
-  sudo ln -sfn "$INSTALL_DIR/fantop" "$SYSTEM_LAUNCHER"
-else
-  echo "Warning: could not install $SYSTEM_LAUNCHER; use sudo with the full fantop path." >&2
+"${ROOT_CMD[@]}" install -d -m 755 "$SYSTEM_DIR"
+"${ROOT_CMD[@]}" install -d -m 755 /var/lib/fantop
+"${ROOT_CMD[@]}" install -m 755 "$SOURCE_DIR/fantop.py" "$SYSTEM_SCRIPT.new"
+"${ROOT_CMD[@]}" mv -Tf "$SYSTEM_SCRIPT.new" "$SYSTEM_SCRIPT"
+LAUNCHER_TEMP="$(mktemp)"
+trap 'rm -f "$LAUNCHER_TEMP"' EXIT
+printf '#!/bin/bash\n# fantop system launcher (managed)\nset -euo pipefail\nexport FANTOP_DATA_DIR=%q\nexec /usr/bin/python3 %q "$@"\n' "$INSTALL_DIR" "$SYSTEM_SCRIPT" > "$LAUNCHER_TEMP"
+"${ROOT_CMD[@]}" install -m 755 "$LAUNCHER_TEMP" "$SYSTEM_LAUNCHER.new"
+"${ROOT_CMD[@]}" mv -Tf "$SYSTEM_LAUNCHER.new" "$SYSTEM_LAUNCHER"
+if { command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet fantop.timer; } ||
+   "${ROOT_CMD[@]}" crontab -l 2>/dev/null | grep -Fx '# fantop (managed; do not edit)' >/dev/null; then
+  "${ROOT_CMD[@]}" "$SYSTEM_LAUNCHER" --install-scheduler
 fi
 
 echo "Installed fantop to $INSTALL_DIR"

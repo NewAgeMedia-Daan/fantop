@@ -13,6 +13,21 @@ SPEC.loader.exec_module(fantop)
 
 
 class ConfigTests(unittest.TestCase):
+    def test_configured_controller_outside_hwmon_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory)
+            (fake / "name").write_text("nct6687\n")
+            (fake / "pwm1").write_text("80\n")
+            (fake / "pwm1_enable").write_text("1\n")
+            config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+            config["fans"] = config["fans"][:1]
+            config["controller"]["path"] = str(fake)
+            original_glob = Path.glob
+            with mock.patch.object(Path, "glob", autospec=True,
+                                   side_effect=lambda path, pattern: [] if str(path) == "/sys/class/hwmon" else original_glob(path, pattern)):
+                with self.assertRaisesRegex(RuntimeError, "Could not find"):
+                    fantop.find_hwmon(config)
+
     def test_hwmon_path_requires_identity_and_channels(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -81,6 +96,12 @@ class CurveTests(unittest.TestCase):
         values, _ = fantop.requested_pwms(config, {"cpu": 70, "hdd": 50, "board": 70})
         self.assertIn("cpu", values)
 
+    def test_missing_sensor_used_by_safety_rule_fails_closed(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["fans"] = [fan for fan in config["fans"] if fan["id"] != "hdd"]
+        with self.assertRaisesRegex(RuntimeError, "hdd"):
+            fantop.requested_pwms(config, {"cpu": 70, "board": 60, "case": 70})
+
 
 class StabilityTests(unittest.TestCase):
     def setUp(self):
@@ -110,6 +131,14 @@ class StabilityTests(unittest.TestCase):
 
 
 class FailSafeTests(unittest.TestCase):
+    def test_sensor_command_has_timeout(self):
+        import subprocess
+        with mock.patch.object(fantop.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("sensors", 5)) as run:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                fantop.read_sensors()
+        self.assertEqual(run.call_args.kwargs["timeout"], fantop.SENSOR_TIMEOUT_SECONDS)
+
     def test_verified_pwm_write(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); (root / "pwm1").write_text("0\n"); (root / "pwm1_enable").write_text("99\n")
@@ -144,7 +173,7 @@ class FailSafeTests(unittest.TestCase):
                 (root / f"pwm{number}").write_text("80\n")
                 (root / f"pwm{number}_enable").write_text("99\n")
             def write(_, number, value, strict=False):
-                if number == 1: raise OSError("controller rejected write")
+                if number == 1 and value != 255: raise OSError("controller rejected write")
                 (root / f"pwm{number}").write_text(f"{value}\n")
                 return value
             with mock.patch.object(fantop, "LOCK_FILE", root / "lock"), \
@@ -185,8 +214,68 @@ class FailSafeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "verification failed"):
                     fantop.write_pwm_verified(root, 1, 173)
 
+    def test_manual_mode_must_be_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pwm1").write_text("255\n")
+            (root / "pwm1_enable").write_text("99\n")
+            original_read = Path.read_text
+            with mock.patch("os.access", return_value=True), \
+                 mock.patch.object(Path, "read_text", autospec=True,
+                                   side_effect=lambda path, *args, **kwargs: "99\n" if path.name == "pwm1_enable" else original_read(path, *args, **kwargs)):
+                with self.assertRaisesRegex(RuntimeError, "manual mode was not accepted"):
+                    fantop.write_pwm_verified(root, 1, 255, strict=True)
+
+    def test_unresponsive_fail_safe_is_reported(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["fans"] = config["fans"][:1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pwm1").write_text("80\n")
+            (root / "pwm1_enable").write_text("99\n")
+            with mock.patch("os.access", return_value=True), mock.patch("time.sleep"), \
+                 mock.patch.object(fantop, "write_pwm_verified", side_effect=RuntimeError("readback stuck")):
+                self.assertIn("readback stuck", fantop.write_fail_safe(root, config)[0])
+
 
 class SchedulerTests(unittest.TestCase):
+    def test_systemd_install_completes_after_enabling_timer(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        with mock.patch("os.geteuid", return_value=0), \
+             mock.patch.object(fantop, "verify_root_runtime"), \
+             mock.patch.object(Path, "write_text"), \
+             mock.patch.object(fantop, "remove_legacy_systemd"), \
+             mock.patch.object(fantop, "remove_cron"), \
+             mock.patch.object(fantop.subprocess, "run") as run:
+            fantop.install_systemd(config)
+        self.assertIn(mock.call(["systemctl", "enable", "--now", "fantop.timer"], check=True),
+                      run.call_args_list)
+
+    def test_crontab_read_error_never_replaces_jobs(self):
+        import subprocess
+        failed = subprocess.CompletedProcess([], 1, "", "permission denied")
+        with mock.patch.object(fantop.subprocess, "run", return_value=failed) as run:
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                fantop.root_crontab_lines()
+        self.assertEqual(run.call_count, 1)
+
+    def test_cron_cleanup_preserves_unmarked_jobs(self):
+        lines = ["# keep", "* * * * * /opt/check_fantop.py", fantop.CRON_MARKER,
+                 "* * * * * /usr/local/bin/fantop --apply", "0 * * * * /opt/backup"]
+        self.assertEqual(fantop.without_managed_cron(lines),
+                         ["# keep", "* * * * * /opt/check_fantop.py", "0 * * * * /opt/backup"])
+
+    def test_root_runtime_rejects_writable_paths(self):
+        import stat
+        from types import SimpleNamespace
+        def details(path):
+            is_file = path in (fantop.SYSTEM_SCRIPT, fantop.SYSTEM_LAUNCHER)
+            mode = (stat.S_IFREG if is_file else stat.S_IFDIR) | (0o777 if path == fantop.SYSTEM_SCRIPT else 0o755)
+            return SimpleNamespace(st_mode=mode, st_uid=0)
+        with mock.patch.object(Path, "lstat", autospec=True, side_effect=details):
+            with self.assertRaisesRegex(RuntimeError, "not protected"):
+                fantop.verify_root_runtime()
+
     def test_crond_counts_as_active(self):
         config = copy.deepcopy(fantop.DEFAULT_CONFIG)
         config["scheduler"] = "cron"
@@ -207,7 +296,8 @@ class SchedulerTests(unittest.TestCase):
         config["scheduler"] = "cron"
         with mock.patch.object(fantop, "install_cron") as cron, \
              mock.patch.object(fantop, "install_systemd") as systemd, \
-             mock.patch.object(fantop, "remove_systemd") as remove:
+             mock.patch.object(fantop, "remove_systemd") as remove, \
+             mock.patch.object(fantop, "verify_root_runtime"):
             fantop.install_scheduler(config)
         cron.assert_called_once_with(config)
         systemd.assert_not_called()
@@ -239,7 +329,9 @@ class SchedulerTests(unittest.TestCase):
             live = root / "config.json"
             pending.write_text(json.dumps(fantop.DEFAULT_CONFIG))
             with mock.patch.object(fantop, "CONFIG_FILE", live), \
+                 mock.patch.object(fantop, "SCRIPT", fantop.SYSTEM_SCRIPT), \
                  mock.patch("os.geteuid", return_value=0), \
+                 mock.patch.object(fantop, "verify_root_runtime"), \
                  mock.patch.object(fantop, "apply_config", return_value=False), \
                  mock.patch.object(fantop, "install_scheduler") as scheduler:
                 with self.assertRaisesRegex(RuntimeError, "not activated"):
@@ -255,7 +347,9 @@ class SchedulerTests(unittest.TestCase):
             live = root / "config.json"
             pending.write_text(json.dumps(fantop.DEFAULT_CONFIG))
             with mock.patch.object(fantop, "CONFIG_FILE", live), \
+                 mock.patch.object(fantop, "SCRIPT", fantop.SYSTEM_SCRIPT), \
                  mock.patch("os.geteuid", return_value=0), \
+                 mock.patch.object(fantop, "verify_root_runtime"), \
                  mock.patch.object(fantop, "apply_config", return_value=True), \
                  mock.patch.object(fantop, "install_scheduler", side_effect=RuntimeError("scheduler failed")):
                 with self.assertRaisesRegex(RuntimeError, "scheduler failed"):
