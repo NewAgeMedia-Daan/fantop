@@ -74,6 +74,32 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fantop.validate_config(config)
 
+    def test_logging_and_boolean_control_values_are_validated(self):
+        for key, value in (("log_max_bytes", "bad"), ("log_max_bytes", 0),
+                           ("log_backups", "bad"), ("log_backups", 0),
+                           ("auto_mode", 1), ("strict_pwm_verification", "false"),
+                           ("respect_calibration_min", "false"),
+                           ("hysteresis_c", float("nan"))):
+            config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+            config["control"][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                fantop.validate_config(config)
+
+    def test_schedule_and_safety_shapes_are_validated(self):
+        for key, value in (("schedule_minutes", 1.0), ("schedule_minutes", True),
+                           ("safety", {"hdd": [{"temp": 42, "middle": "200"}]}),
+                           ("safety", {"board": [{"temp": float("nan"), "middle": 200}]})):
+            config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+            config[key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                fantop.validate_config(config)
+
+    def test_controller_path_rejects_embedded_nul(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["controller"]["path"] = "/sys/class/hwmon/\x00"
+        with self.assertRaises(ValueError):
+            fantop.validate_config(config)
+
     def test_fail_safe_pwm_must_be_full_speed(self):
         for value in (0, 128, 254):
             config = copy.deepcopy(fantop.DEFAULT_CONFIG)
@@ -149,6 +175,15 @@ class StabilityTests(unittest.TestCase):
 
 
 class FailSafeTests(unittest.TestCase):
+    def test_apply_reports_busy_controller_as_skipped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            live = Path(directory) / "config.json"
+            live.write_text(__import__("json").dumps(fantop.DEFAULT_CONFIG))
+            with mock.patch.object(fantop, "CONFIG_FILE", live), \
+                 mock.patch.object(fantop, "apply_config", return_value=False), \
+                 mock.patch("sys.argv", ["fantop", "--apply"]):
+                self.assertEqual(fantop.main(), 1)
+
     def test_malformed_config_forces_recovery_on_apply(self):
         with tempfile.TemporaryDirectory() as directory:
             bad_config = Path(directory) / "config.json"
@@ -348,6 +383,143 @@ class FailSafeTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_scheduler_removal_reports_failed_timer_stop(self):
+        import subprocess
+        with mock.patch.object(fantop.shutil, "which", return_value="/usr/bin/systemctl"), \
+             mock.patch.object(Path, "exists", return_value=True), \
+             mock.patch.object(Path, "unlink") as unlink, \
+             mock.patch.object(fantop.subprocess, "run",
+                               side_effect=subprocess.CalledProcessError(1, "systemctl")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                fantop.remove_systemd()
+        unlink.assert_not_called()
+
+    def test_restore_auto_disables_schedule_and_verifies_modes(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["fans"] = config["fans"][:1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mode = root / "pwm1_enable"
+            mode.write_text("1\n")
+            with mock.patch.object(fantop, "LOCK_FILE", root / "lock"), \
+                 mock.patch.object(fantop, "find_hwmon", return_value=root), \
+                 mock.patch.object(fantop, "uninstall_scheduler") as uninstall, \
+                 mock.patch("os.geteuid", return_value=0):
+                fantop.restore_auto(config)
+            uninstall.assert_called_once()
+            self.assertEqual(mode.read_text().strip(), "99")
+
+    def test_restore_auto_reverts_to_full_speed_if_mode_is_rejected(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["fans"] = config["fans"][:1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mode = root / "pwm1_enable"
+            mode.write_text("1\n")
+            original_read = Path.read_text
+            with mock.patch.object(fantop, "LOCK_FILE", root / "lock"), \
+                 mock.patch.object(fantop, "find_hwmon", return_value=root), \
+                 mock.patch.object(fantop, "uninstall_scheduler"), \
+                 mock.patch.object(fantop, "write_fail_safe", return_value=[]) as emergency, \
+                 mock.patch.object(Path, "read_text", autospec=True,
+                                   side_effect=lambda path, *a, **kw: "1\n" if path == mode else original_read(path, *a, **kw)), \
+                 mock.patch("os.geteuid", return_value=0), \
+                 self.assertRaisesRegex(RuntimeError, "mode was not accepted"):
+                fantop.restore_auto(config)
+            emergency.assert_called_once_with(root, config)
+
+    def test_restore_auto_uses_fail_safe_if_scheduler_cannot_stop(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(fantop, "LOCK_FILE", root / "lock"), \
+                 mock.patch.object(fantop, "find_hwmon", return_value=root), \
+                 mock.patch.object(fantop, "uninstall_scheduler", side_effect=RuntimeError("stop failed")), \
+                 mock.patch.object(fantop, "write_fail_safe", return_value=[]) as emergency, \
+                 mock.patch("os.geteuid", return_value=0), \
+                 self.assertRaisesRegex(RuntimeError, "Could not stop scheduler"):
+                fantop.restore_auto(config)
+            emergency.assert_called_once_with(root, config)
+
+    def test_recovery_commands_work_with_malformed_live_config(self):
+        with mock.patch.object(fantop, "load_config", side_effect=ValueError("malformed")), \
+             mock.patch.object(fantop, "load_recovery_config", return_value=copy.deepcopy(fantop.DEFAULT_CONFIG)), \
+             mock.patch.object(fantop, "restore_auto") as restore, \
+             mock.patch("sys.argv", ["fantop", "--restore-auto"]):
+            self.assertEqual(fantop.main(), 0)
+        restore.assert_called_once()
+        with mock.patch.object(fantop, "load_config", side_effect=AssertionError("config loaded")), \
+             mock.patch.object(fantop, "uninstall_scheduler") as uninstall, \
+             mock.patch("sys.argv", ["fantop", "--uninstall-scheduler"]):
+            self.assertEqual(fantop.main(), 0)
+        uninstall.assert_called_once()
+
+    def test_log_tail_rejects_nonpositive_counts_without_opening_editor(self):
+        with mock.patch.object(fantop, "load_config", side_effect=AssertionError("config loaded")), \
+             mock.patch.object(fantop, "run_tui") as editor, \
+             mock.patch("sys.argv", ["fantop", "--log-tail", "0"]):
+            self.assertEqual(fantop.main(), 1)
+        editor.assert_not_called()
+
+    def test_setup_stages_draft_without_replacing_scheduled_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live, draft = root / "config.json", root / "setup-draft.json"
+            old = copy.deepcopy(fantop.DEFAULT_CONFIG)
+            live.write_text(__import__("json").dumps(old))
+            discovered = [{"name": "nct6687", "channels": [{"pwm": 1}, {"pwm": 4}]}]
+            with mock.patch.object(fantop, "CONFIG_FILE", live), \
+                 mock.patch.object(fantop, "SETUP_DRAFT_FILE", draft), \
+                 mock.patch.object(fantop, "discover_controllers", return_value=discovered):
+                fantop.setup_from_discovery()
+            self.assertEqual(__import__("json").loads(live.read_text()), old)
+            self.assertEqual([fan["id"] for fan in __import__("json").loads(draft.read_text())["fans"]],
+                             ["pwm1", "pwm4"])
+
+    def test_setup_can_stage_a_draft_with_malformed_live_config(self):
+        with mock.patch.object(fantop, "load_config", side_effect=AssertionError("config loaded")), \
+             mock.patch.object(fantop, "setup_from_discovery") as setup, \
+             mock.patch("sys.argv", ["fantop", "--setup"]):
+            self.assertEqual(fantop.main(), 0)
+        setup.assert_called_once()
+
+    def test_editor_loads_setup_draft_when_live_config_is_malformed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            draft = Path(directory) / "setup-draft.json"
+            draft.write_text(__import__("json").dumps(fantop.DEFAULT_CONFIG))
+            with mock.patch.object(fantop, "SETUP_DRAFT_FILE", draft), \
+                 mock.patch.object(fantop, "load_config", side_effect=ValueError("malformed")), \
+                 mock.patch.object(fantop, "run_tui") as editor, \
+                 mock.patch("sys.argv", ["fantop"]):
+                self.assertEqual(fantop.main(), 0)
+            editor.assert_called_once_with(mock.ANY, {})
+
+    def test_successful_editor_save_removes_setup_draft(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            draft = root / "setup-draft.json"
+            draft.write_text("draft")
+            editor = fantop.FantopTUI(mock.Mock(), copy.deepcopy(fantop.DEFAULT_CONFIG), {})
+            with mock.patch.object(fantop, "CONFIG_FILE", root / "config.json"), \
+                 mock.patch.object(fantop, "SETUP_DRAFT_FILE", draft), \
+                 mock.patch.object(editor, "terminal_command", return_value=mock.Mock(returncode=0)), \
+                 mock.patch.object(editor, "refresh_live"):
+                editor.save_apply()
+            self.assertFalse(draft.exists())
+            self.assertFalse(editor.status_error)
+
+    def test_direct_cron_install_selects_cron_scheduler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            live = Path(directory) / "config.json"
+            live.write_text(__import__("json").dumps(fantop.DEFAULT_CONFIG))
+            with mock.patch.object(fantop, "CONFIG_FILE", live), \
+                 mock.patch.object(fantop, "save_recovery_config"), \
+                 mock.patch.object(fantop, "install_scheduler") as scheduler, \
+                 mock.patch("sys.argv", ["fantop", "--install-cron"]):
+                self.assertEqual(fantop.main(), 0)
+            self.assertEqual(scheduler.call_args.args[0]["scheduler"], "cron")
+            self.assertEqual(__import__("json").loads(live.read_text())["scheduler"], "cron")
+
     def test_direct_scheduler_install_saves_recovery_config(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"

@@ -2,6 +2,26 @@
 
 All notable changes to fantop are documented here.
 
+## 4.0.5 - 2026-09-23
+
+### Fixed
+
+- Validate logging, mode, and boolean control values before scheduled control
+- Make firmware restore and scheduler removal available when the editable
+  configuration is malformed, using the protected recovery copy for restore
+- Save hardware discovery as an editor draft so an active schedule keeps using
+  its existing, reviewed configuration until the draft is applied
+- Make direct cron installation select cron and remove an existing systemd timer
+- Keep diagnostics available when the editable configuration is damaged
+- Validate schedule and safety-rule values and require at least one enabled fan
+- Stop managed scheduling during firmware restore and verify each channel's
+  mode, recovering to full speed if the controller rejects the restore
+- Report controller-lock skips as unsuccessful applies and reject malformed
+  controller paths before scheduled control
+- Report failed systemd timer shutdown instead of deleting its unit files and
+  claiming firmware restoration succeeded
+- Reject invalid log-tail counts before launching the editor
+
 ## 4.0.4 - 2026-09-23
 
 ### Fixed

@@ -118,10 +118,10 @@ Discovery is read-only and does not change fan speeds.
 
 1. Run `fantop --doctor` and resolve every failed prerequisite.
 2. Run `fantop --discover` and verify the detected controller and channels.
-3. Run `fantop --setup` to generate a configuration from active channels.
-   Existing configurations require `fantop --setup --yes` to replace them.
-4. Launch `fantop`, label each active header, select temperature sources,
-   and review every curve.
+3. Run `fantop --setup` to draft a configuration from active channels. The
+   saved configuration and any active schedule keep running.
+4. Launch `fantop` to open the draft, label each active header, select
+   temperature sources, and review every curve.
 5. Save from the TUI. Saving requests sudo access, applies the curves immediately,
    and creates or updates the managed systemd timer or root cron fallback. The
    saved configuration changes only after application and scheduler setup succeed.
@@ -150,21 +150,25 @@ scheduler fails with an error instead of silently selecting another one.
 | `fantop --doctor` | Check prerequisites and available hardware support |
 | `fantop --discover` | List active controllable PWM channels |
 | `fantop --discover --all-channels` | List all controllable PWM channels, including inactive or zero-RPM headers |
-| `fantop --setup` | Configure active discovered channels |
+| `fantop --setup` | Draft curves for active discovered channels |
 | `fantop --dry-run` | Calculate targets without writing PWM values |
 | `sudo fantop --calibrate --yes` | Run bounded PWM/RPM calibration |
-| `sudo fantop --restore-auto` | Restore firmware fan control |
+| `sudo fantop --restore-auto` | Stop managed scheduling and restore firmware fan control |
 | `fantop --schedule 5` | Save a five-minute scheduler interval |
 | `sudo fantop --install-scheduler` | Install the systemd timer or cron fallback |
+| `sudo fantop --install-cron` | Select cron and replace an existing systemd timer |
 | `sudo fantop --uninstall-scheduler` | Remove the managed scheduler |
 | `fantop --log-tail 50` | Show the last 50 rotating log entries |
 | `sudo fantop --apply` | Apply the saved curves once |
 | `sudo fantop --fail-safe` | Force configured channels to full speed using the protected recovery config |
 
-If the editable configuration is malformed or missing, scheduled application
-sets the previously configured channels to PWM 255 and reports an error. The
-emergency command uses the protected recovery copy even when the editable file
-cannot be read. A fan with calibration data and zero RPM receives a startup
+The setup draft lives at `INSTALL_DIR/.config/fantop/setup-draft.json` and is
+removed after a successful Save. Exiting the editor without saving leaves the
+draft for the next launch. If the editable configuration is malformed or
+missing, scheduled application sets the previously configured channels to PWM
+255 and reports an error. The emergency command uses the protected recovery
+copy even when the editable file cannot be read. A fan with calibration data
+and zero RPM receives a startup
 pulse; fantop raises it to PWM 255 if necessary and reports a failure if RPM
 does not appear. Keep fan tachometer feedback connected for this check.
 Hardware controlled ramps can take several seconds. The fail-safe command
@@ -291,7 +295,7 @@ manual mode. Keep a firmware/BIOS fallback available and test curves under load.
 The default profile includes HDD and board-temperature airflow floors. Review
 and adapt every sensor mapping and safety threshold for the target hardware.
 If required temperatures cannot be read, configured channels are driven to the
-fail-safe PWM (255 by default), and the apply command exits with an error.
+fail-safe PWM 255, and the apply command exits with an error.
 Sensor reads time out after five seconds. Sensors used by active safety rules
 are required even when their dedicated fan group is disabled.
 If a PWM write fails, fantop attempts fail-safe writes on every configured

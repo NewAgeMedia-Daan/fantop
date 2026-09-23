@@ -19,6 +19,7 @@ import tempfile
 import time
 import shutil
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
@@ -27,6 +28,7 @@ SYSTEM_SCRIPT = Path("/usr/local/lib/fantop/fantop.py")
 SYSTEM_LAUNCHER = Path("/usr/local/bin/fantop")
 USER_HOME = Path(os.environ.get("FANTOP_DATA_DIR", str(SCRIPT.parent))).resolve()
 CONFIG_FILE = USER_HOME / ".config" / "fantop" / "config.json"
+SETUP_DRAFT_FILE = CONFIG_FILE.parent / "setup-draft.json"
 STATE_FILE = Path("/var/lib/fantop/state.json")
 RECOVERY_CONFIG_FILE = STATE_FILE.parent / "recovery-config.json"
 LOG_FILE = Path("/var/lib/fantop/fantop.log")
@@ -37,7 +39,7 @@ LEGACY_CRON_MARKERS = ("# fan-control-tui (managed; do not edit)",
 LEGACY_CONFIG_DIRS = (USER_HOME / ".config" / "nam-fan-control",
                       USER_HOME.parent / "fan-control-tui" / ".config" / "nam-fan-control",
                       Path.home() / ".config" / "nam-fan-control")
-APP_VERSION = "4.0.4"
+APP_VERSION = "4.0.5"
 SENSOR_TIMEOUT_SECONDS = 5
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -101,38 +103,79 @@ def validate_config(data: Any) -> dict[str, Any]:
     fans = data.get("fans")
     if not isinstance(fans, list) or not fans:
         raise ValueError("Config must contain at least one fan group")
+    if any(not isinstance(fan, dict) for fan in fans):
+        raise ValueError("Every fan must be an object")
+    if any(not isinstance(fan.get("id"), str) or not fan["id"].strip() for fan in fans):
+        raise ValueError("Every fan needs a nonempty ID")
     if len({fan.get("id") for fan in fans}) != len(fans):
         raise ValueError("Fan IDs must be unique")
-    if data.get("schedule_minutes", 1) not in (1, 2, 3, 5, 10, 15, 30, 60):
+    if not any(fan.get("enabled", True) is True for fan in fans):
+        raise ValueError("At least one fan must be enabled")
+    if (type(data.get("schedule_minutes", 1)) is not int or
+            data.get("schedule_minutes", 1) not in (1, 2, 3, 5, 10, 15, 30, 60)):
         raise ValueError("Invalid schedule interval")
     if data.get("scheduler", "auto") not in ("auto", "systemd", "cron"):
         raise ValueError("scheduler must be auto, systemd, or cron")
     control = data.setdefault("control", {})
+    if not isinstance(control, dict): raise ValueError("control must be an object")
     for key, value in DEFAULT_CONFIG["control"].items(): control.setdefault(key, value)
-    if control.get("fail_safe_pwm") != 255:
+    if type(control.get("fail_safe_pwm")) is not int or control["fail_safe_pwm"] != 255:
         raise ValueError("fail_safe_pwm must be 255")
-    if not 0 <= control.get("hysteresis_c", -1) <= 20:
+    if (type(control["hysteresis_c"]) not in (int, float) or
+            not math.isfinite(control["hysteresis_c"]) or
+            not 0 <= control["hysteresis_c"] <= 20):
         raise ValueError("hysteresis_c must be 0-20")
-    if not 0 < control.get("smoothing_alpha", 0) <= 1:
+    if (type(control["smoothing_alpha"]) not in (int, float) or
+            not math.isfinite(control["smoothing_alpha"]) or
+            not 0 < control["smoothing_alpha"] <= 1):
         raise ValueError("smoothing_alpha must be >0 and <=1")
-    if not isinstance(data.get("controller"), dict) or not data["controller"].get("name"):
+    if type(control["log_max_bytes"]) is not int or not 1024 <= control["log_max_bytes"] <= 100_000_000:
+        raise ValueError("log_max_bytes must be 1024-100000000")
+    if type(control["log_backups"]) is not int or not 1 <= control["log_backups"] <= 20:
+        raise ValueError("log_backups must be 1-20")
+    if (type(control["auto_mode"]) is not int or
+            not (control["auto_mode"] == 0 or 2 <= control["auto_mode"] <= 255)):
+        raise ValueError("auto_mode must be 0 or 2-255")
+    for key in ("respect_calibration_min", "strict_pwm_verification"):
+        if type(control[key]) is not bool: raise ValueError(f"{key} must be boolean")
+    if (not isinstance(data.get("controller"), dict) or
+            not isinstance(data["controller"].get("name"), str) or
+            not data["controller"]["name"].strip() or
+            "\x00" in data["controller"]["name"] or
+            not isinstance(data["controller"].get("path", "auto"), str) or
+            "\x00" in data["controller"].get("path", "auto")):
         raise ValueError("controller must contain a name")
+    safety = data.get("safety", {})
+    if not isinstance(safety, dict): raise ValueError("safety must be an object")
+    for sensor, rules in safety.items():
+        if sensor not in ("hdd", "board") or not isinstance(rules, list):
+            raise ValueError("Invalid safety sensor or rules")
+        for rule in rules:
+            if not isinstance(rule, dict) or type(rule.get("temp")) not in (int, float):
+                raise ValueError("Safety rules need a numeric temperature")
+            if not math.isfinite(rule["temp"]) or not 0 <= rule["temp"] <= 100:
+                raise ValueError("Safety temperatures must be 0-100")
+            for key, value in rule.items():
+                if key == "temp": continue
+                if key not in ("middle", "exhaust") or type(value) is not int or not 0 <= value <= 255:
+                    raise ValueError("Safety PWM floors must be 0-255")
     pwm_channels: set[int] = set()
     for fan in fans:
+        if not isinstance(fan.get("name"), str): raise ValueError("fan name must be text")
         if not isinstance(fan.get("enabled", True), bool): raise ValueError("fan enabled must be boolean")
         if fan.get("mode") not in {"step", "linear"}:
             raise ValueError(f"Invalid curve mode for {fan.get('id')}")
-        if not isinstance(fan.get("pwm"), int) or fan["pwm"] not in range(1, 33):
+        if type(fan.get("pwm")) is not int or fan["pwm"] not in range(1, 33):
             raise ValueError(f"Invalid PWM channel for {fan.get('id')}")
         if fan["pwm"] in pwm_channels: raise ValueError("PWM channels must be unique")
         pwm_channels.add(fan["pwm"])
-        if not isinstance(fan.get("fan_input", fan["pwm"]), int) or fan.get("fan_input", fan["pwm"]) not in range(1, 33):
+        if type(fan.get("fan_input", fan["pwm"])) is not int or fan.get("fan_input", fan["pwm"]) not in range(1, 33):
             raise ValueError(f"Invalid fan input for {fan.get('id')}")
         calibration = fan.get("calibration", {})
         if not isinstance(calibration, dict): raise ValueError("calibration must be an object")
         for key in ("minimum_pwm", "startup_pwm"):
             value = calibration.get(key)
-            if value is not None and (not isinstance(value, int) or not 0 <= value <= 255):
+            if value is not None and (type(value) is not int or not 0 <= value <= 255):
                 raise ValueError(f"Invalid {key} for {fan.get('id')}")
         if fan.get("sensor") not in {"cpu", "hdd", "system", "vrm", "pch", "board", "case"}:
             raise ValueError(f"Invalid sensor source for {fan.get('id')}")
@@ -142,7 +185,7 @@ def validate_config(data: Any) -> dict[str, Any]:
         previous = -1
         for point in points:
             if not (isinstance(point, list) and len(point) == 2
-                    and all(isinstance(value, int) for value in point)):
+                    and all(type(value) is int for value in point)):
                 raise ValueError("Every curve point must be [integer temperature, integer PWM]")
             temp, pwm = point
             if not 0 <= temp <= 100 or not 0 <= pwm <= 255 or temp <= previous:
@@ -641,7 +684,10 @@ def install_systemd(config: dict[str, Any]) -> None:
 
 def remove_legacy_systemd() -> None:
     if not shutil.which("systemctl"): return
-    subprocess.run(["systemctl", "disable", "--now", "fan-control-tui.timer"], capture_output=True)
+    legacy_timer = Path("/etc/systemd/system/fan-control-tui.timer")
+    if legacy_timer.exists() or subprocess.run(["systemctl", "is-active", "fan-control-tui.timer"],
+                                                capture_output=True).returncode == 0:
+        subprocess.run(["systemctl", "disable", "--now", "fan-control-tui.timer"], check=True)
     for name in ("fan-control-tui.timer", "fan-control-tui.service", "fan-control-tui-failsafe.service"):
         try: (Path("/etc/systemd/system") / name).unlink()
         except FileNotFoundError: pass
@@ -688,8 +734,10 @@ def activate_config(path: Path) -> None:
 
 def remove_systemd() -> None:
     running = bool(shutil.which("systemctl") and Path("/run/systemd/system").exists())
-    if running:
-        subprocess.run(["systemctl", "disable", "--now", "fantop.timer"], capture_output=True)
+    timer_path = Path("/etc/systemd/system/fantop.timer")
+    if running and (timer_path.exists() or subprocess.run(["systemctl", "is-active", "fantop.timer"],
+                                                           capture_output=True).returncode == 0):
+        subprocess.run(["systemctl", "disable", "--now", "fantop.timer"], check=True)
     for name in ("fantop.timer", "fantop.service", "fantop-failsafe.service"):
         try: (Path("/etc/systemd/system") / name).unlink()
         except FileNotFoundError: pass
@@ -705,18 +753,39 @@ def uninstall_scheduler() -> None:
 
 
 def restore_auto(config: dict[str, Any]) -> None:
-    hwmon = find_hwmon(config); mode = int(config.get("control", {}).get("auto_mode", 99))
-    for fan in config["fans"]:
-        if not fan.get("enabled", True): continue
-        path = hwmon / f"pwm{fan['pwm']}_enable"
-        if not os.access(path, os.W_OK): raise PermissionError(f"{path} is not writable")
-        path.write_text(f"{mode}\n")
+    if os.geteuid() != 0: raise PermissionError("Firmware restore must run as root")
+    lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        hwmon = find_hwmon(config)
+        try:
+            uninstall_scheduler()
+        except Exception as exc:
+            recovery_errors = write_fail_safe(hwmon, config)
+            raise RuntimeError(f"Could not stop scheduler before firmware restore: {exc}" +
+                               ("; fail-safe errors: " + "; ".join(recovery_errors) if recovery_errors else "")) from exc
+        mode = int(config.get("control", {}).get("auto_mode", 99))
+        errors: list[str] = []
+        for fan in config["fans"]:
+            if not fan.get("enabled", True): continue
+            path = hwmon / f"pwm{fan['pwm']}_enable"
+            try:
+                if not os.access(path, os.W_OK): raise PermissionError(f"{path} is not writable")
+                path.write_text(f"{mode}\n")
+                if int(path.read_text()) != mode:
+                    raise RuntimeError("firmware mode was not accepted")
+            except Exception as exc:
+                errors.append(f"PWM{fan['pwm']}: {exc}")
+        if errors:
+            recovery_errors = write_fail_safe(hwmon, config)
+            raise RuntimeError("Firmware restore failed: " + "; ".join(errors) +
+                               ("; fail-safe errors: " + "; ".join(recovery_errors) if recovery_errors else ""))
+    finally:
+        os.close(lock_fd)
     print(f"Restored firmware/automatic mode ({mode}) for configured channels")
 
 
-def setup_from_discovery(config: dict[str, Any], overwrite: bool = False) -> dict[str, Any]:
-    if CONFIG_FILE.exists() and not overwrite:
-        raise RuntimeError("Config exists; repeat with --yes to replace it")
+def setup_from_discovery() -> dict[str, Any]:
     controllers = discover_controllers(True)
     if not controllers: raise RuntimeError("No active PWM channels with RPM feedback found")
     controller = controllers[0]
@@ -729,7 +798,8 @@ def setup_from_discovery(config: dict[str, Any], overwrite: bool = False) -> dic
             "pwm": number, "fan_input": number, "sensor": "cpu", "mode": "linear", "enabled": True,
             "points": [[0, 90], [45, 100], [55, 130], [65, 180], [75, 220], [85, 255]]})
     result["safety"] = {}
-    atomic_save(result); print(f"Configured {len(result['fans'])} active channel(s) on {controller['name']}")
+    atomic_save(result, SETUP_DRAFT_FILE)
+    print(f"Drafted {len(result['fans'])} active channel(s) on {controller['name']}; launch fantop and Save to activate")
     return result
 
 
@@ -800,9 +870,11 @@ def scheduler_active(config: dict[str, Any]) -> bool:
 
 
 class FantopTUI:
-    def __init__(self, screen: curses.window, config: dict[str, Any]):
+    def __init__(self, screen: curses.window, config: dict[str, Any],
+                 saved: dict[str, Any] | None = None):
         self.screen = screen
-        self.config, self.saved = copy.deepcopy(config), copy.deepcopy(config)
+        self.config = copy.deepcopy(config)
+        self.saved = copy.deepcopy(config if saved is None else saved)
         self.fan_index = self.point_index = 0
         self.status, self.status_error = "Ready — edits are unsaved until Save", False
         self.last_live = 0.0
@@ -1061,7 +1133,11 @@ class FantopTUI:
             result = self.terminal_command(["sudo", str(SYSTEM_LAUNCHER), "--activate-config", str(pending)])
             if result.returncode == 0:
                 self.saved = copy.deepcopy(self.config)
-                self.status, self.status_error = "Saved, applied, and scheduler ensured", False
+                try:
+                    SETUP_DRAFT_FILE.unlink(missing_ok=True)
+                    self.status, self.status_error = "Saved, applied, and scheduler ensured", False
+                except OSError as exc:
+                    self.status, self.status_error = f"Saved and applied; could not remove setup draft: {exc}", True
                 self.refresh_live(True)
             else:
                 self.status, self.status_error = "Apply or scheduler failed; config remains unsaved", True
@@ -1360,10 +1436,10 @@ class FantopTUI:
             self.draw(); self.handle(self.screen.getch())
 
 
-def run_tui(config: dict[str, Any]) -> None:
+def run_tui(config: dict[str, Any], saved: dict[str, Any] | None = None) -> None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError("The editor needs an interactive terminal")
-    curses.wrapper(lambda screen: FantopTUI(screen, config).run())
+    curses.wrapper(lambda screen: FantopTUI(screen, config, saved).run())
 
 
 def print_status(config: dict[str, Any]) -> None:
@@ -1396,9 +1472,9 @@ def main() -> int:
     parser.add_argument("--sync-recovery-config", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--uninstall-scheduler", action="store_true", help="remove managed systemd/cron scheduler")
     parser.add_argument("--restore-auto", action="store_true", help="restore firmware/automatic PWM mode")
-    parser.add_argument("--setup", action="store_true", help="create config from active discovered channels")
+    parser.add_argument("--setup", action="store_true", help="draft a config from active discovered channels")
     parser.add_argument("--calibrate", action="store_true", help="calibrate configured PWM/RPM channels")
-    parser.add_argument("--yes", action="store_true", help="confirm destructive setup/calibration operation")
+    parser.add_argument("--yes", action="store_true", help="confirm calibration operation")
     parser.add_argument("--dry-run", action="store_true", help="calculate targets without writing PWM")
     parser.add_argument("--log-tail", type=int, metavar="LINES", help="show recent controller log lines")
     parser.add_argument("--status", action="store_true", help="print temperatures, PWM, and RPM")
@@ -1420,6 +1496,9 @@ def main() -> int:
         if args.activate_config:
             activate_config(args.activate_config)
             return 0
+        if args.uninstall_scheduler:
+            uninstall_scheduler()
+            return 0
         if args.fail_safe:
             try:
                 recovery = load_recovery_config()
@@ -1427,6 +1506,33 @@ def main() -> int:
                 if not CONFIG_FILE.is_file(): raise RuntimeError("No saved config to recover")
                 recovery = load_config()
             force_fail_safe(recovery)
+            return 0
+        if args.restore_auto:
+            try:
+                recovery = load_config()
+            except Exception:
+                recovery = load_recovery_config()
+            restore_auto(recovery)
+            return 0
+        if args.setup:
+            setup_from_discovery()
+            return 0
+        if args.log_tail is not None:
+            if args.log_tail <= 0: raise ValueError("--log-tail requires a positive line count")
+            try: print("\n".join(LOG_FILE.read_text().splitlines()[-args.log_tail:]))
+            except FileNotFoundError: print("No log file yet")
+            return 0
+        if args.doctor:
+            for name, ok, detail in prerequisites(): print(f"[{'OK' if ok else 'FAIL'}] {name}: {detail}")
+            controllers = discover_controllers(False)
+            print(f"[{'OK' if controllers else 'FAIL'}] PWM controllers: {len(controllers)}")
+            return 0
+        if args.discover:
+            for controller in discover_controllers(not args.all_channels):
+                print(f"{controller['name']}  {controller['path']}")
+                for channel in controller['channels']:
+                    state = "active" if channel['active'] else "inactive"
+                    print(f"  PWM{channel['pwm']}: {state}, RPM={channel['rpm']}, writable={channel['writable']}")
             return 0
         if args.apply:
             try:
@@ -1436,35 +1542,34 @@ def main() -> int:
                 recovery = load_recovery_config()
                 force_fail_safe(recovery)
                 raise RuntimeError(f"Invalid saved config; fail-safe PWM applied: {exc}") from exc
-            apply_config(config)
+            if not apply_config(config):
+                raise RuntimeError("Fan control is already running; apply was skipped")
+            return 0
+        if not any(vars(args).values()) and SETUP_DRAFT_FILE.is_file():
+            with SETUP_DRAFT_FILE.open(encoding="utf-8") as handle:
+                draft = validate_config(json.load(handle))
+            try: saved = load_config()
+            except Exception: saved = {}
+            run_tui(draft, saved)
             return 0
         config = load_config()
-        if args.setup: config = setup_from_discovery(config, args.yes)
         if args.init_config and not CONFIG_FILE.exists(): atomic_save(config); print(f"Created {CONFIG_FILE}")
         if args.schedule: config["schedule_minutes"] = args.schedule; atomic_save(config)
+        if args.install_cron:
+            if not CONFIG_FILE.is_file(): raise RuntimeError("Save a config before installing cron")
+            candidate = copy.deepcopy(config)
+            candidate["scheduler"] = "cron"
+            save_recovery_config(candidate)
+            install_scheduler(candidate)
+            atomic_save(candidate)
+            return 0
         if args.install_cron or args.install_scheduler:
             if not CONFIG_FILE.is_file(): raise RuntimeError("Save a config before installing the scheduler")
             save_recovery_config(config)
-        if args.install_cron: install_cron(config)
         if args.install_scheduler: install_scheduler(config)
-        if args.uninstall_scheduler: uninstall_scheduler()
-        if args.restore_auto: restore_auto(config)
         if args.calibrate: calibrate(config, args.yes)
         if args.status: print_status(config)
         if args.dry_run: print_dry_run(config)
-        if args.log_tail:
-            try: print("\n".join(LOG_FILE.read_text().splitlines()[-args.log_tail:]))
-            except FileNotFoundError: print("No log file yet")
-        if args.doctor:
-            for name, ok, detail in prerequisites(): print(f"[{'OK' if ok else 'FAIL'}] {name}: {detail}")
-            controllers = discover_controllers(False)
-            print(f"[{'OK' if controllers else 'FAIL'}] PWM controllers: {len(controllers)}")
-        if args.discover:
-            for controller in discover_controllers(not args.all_channels):
-                print(f"{controller['name']}  {controller['path']}")
-                for channel in controller['channels']:
-                    state = "active" if channel['active'] else "inactive"
-                    print(f"  PWM{channel['pwm']}: {state}, RPM={channel['rpm']}, writable={channel['writable']}")
         actions = (args.activate_config, args.sync_recovery_config, args.apply, args.fail_safe, args.install_cron, args.install_scheduler, args.uninstall_scheduler,
                    args.restore_auto, args.setup, args.calibrate, args.status, args.dry_run,
                    args.log_tail, args.init_config, args.doctor, args.discover, args.schedule)
