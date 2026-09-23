@@ -37,7 +37,7 @@ LEGACY_CRON_MARKERS = ("# fan-control-tui (managed; do not edit)",
 LEGACY_CONFIG_DIRS = (USER_HOME / ".config" / "nam-fan-control",
                       USER_HOME.parent / "fan-control-tui" / ".config" / "nam-fan-control",
                       Path.home() / ".config" / "nam-fan-control")
-APP_VERSION = "4.0.3"
+APP_VERSION = "4.0.4"
 SENSOR_TIMEOUT_SECONDS = 5
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -441,20 +441,21 @@ def apply_config(config: dict[str, Any], quiet: bool = False,
             values = stabilize_pwms(config, temps, targets, load_state())
         except Exception as exc:
             sensor_error = exc
-            fail_safe = 255
-            values = {fan["id"]: fail_safe for fan in config["fans"] if fan.get("enabled", True)}
-            temps, overrides = {}, [f"FAIL-SAFE: {exc}"]
-            logger.error("fail-safe PWM=%s reason=%s", fail_safe, exc)
+            logger.error("fail-safe PWM=255 reason=%s", exc)
+        if sensor_error is not None:
+            recovery_errors = write_fail_safe(hwmon, config)
+            if recovery_errors:
+                raise RuntimeError(f"Sensor failure: {sensor_error}; fail-safe errors: " +
+                                   "; ".join(recovery_errors)) from sensor_error
+            raise RuntimeError(f"Sensor failure; fail-safe PWM applied: {sensor_error}") from sensor_error
         observed: dict[str, int] = {}
         errors: list[str] = []
         for fan in config["fans"]:
             if not fan.get("enabled", True): continue
             pwm = fan["pwm"]
             try:
-                if sensor_error is None:
-                    ensure_fan_started(hwmon, fan, values[fan["id"]])
+                ensure_fan_started(hwmon, fan, values[fan["id"]])
                 actual = write_pwm_verified(hwmon, pwm, values[fan["id"]],
-                                            sensor_error is not None or
                                             bool(config["control"].get("strict_pwm_verification", False)))
                 observed[fan["id"]] = actual
                 if actual != values[fan["id"]]:
@@ -466,8 +467,6 @@ def apply_config(config: dict[str, Any], quiet: bool = False,
             logger.critical("PWM write failure=%s; recovery failure=%s", errors, recovery_errors)
             raise RuntimeError("PWM write failed: " + "; ".join(errors) +
                                ("; fail-safe errors: " + "; ".join(recovery_errors) if recovery_errors else ""))
-        if sensor_error is not None:
-            raise RuntimeError(f"Sensor failure; fail-safe PWM applied: {sensor_error}") from sensor_error
         if record_recovery and SCRIPT == SYSTEM_SCRIPT and os.geteuid() == 0:
             try:
                 save_recovery_config(config)
@@ -490,15 +489,30 @@ def apply_config(config: dict[str, Any], quiet: bool = False,
 
 
 def write_fail_safe(hwmon: Path, config: dict[str, Any]) -> list[str]:
-    value = 255
     errors: list[str] = []
+    pending: dict[int, Path] = {}
     for fan in config["fans"]:
         if not fan.get("enabled", True): continue
         number = fan["pwm"]
         try:
-            write_pwm_verified(hwmon, number, value, strict=True)
+            path, _ = set_pwm_target(hwmon, number, 255)
+            pending[number] = path
         except Exception as exc:
             errors.append(f"PWM{number}: {exc}")
+    for _ in range(90):
+        for number, path in list(pending.items()):
+            try:
+                if int(path.read_text()) == 255:
+                    del pending[number]
+            except (OSError, ValueError) as exc:
+                errors.append(f"PWM{number}: {exc}")
+                del pending[number]
+        if not pending: break
+        time.sleep(0.5)
+    for number, path in pending.items():
+        try: actual = path.read_text().strip()
+        except OSError as exc: actual = str(exc)
+        errors.append(f"PWM{number}: fail-safe write verification failed: requested 255, read {actual}")
     return errors
 
 
@@ -516,7 +530,7 @@ def force_fail_safe(config: dict[str, Any]) -> None:
     print(f"Forced configured channels to fail-safe PWM {value}")
 
 
-def write_pwm_verified(hwmon: Path, number: int, value: int, strict: bool = False) -> int:
+def set_pwm_target(hwmon: Path, number: int, value: int) -> tuple[Path, int]:
     enable_path, pwm_path = hwmon / f"pwm{number}_enable", hwmon / f"pwm{number}"
     if not os.access(enable_path, os.W_OK) or not os.access(pwm_path, os.W_OK):
         raise PermissionError(f"PWM{number} is not writable")
@@ -524,27 +538,29 @@ def write_pwm_verified(hwmon: Path, number: int, value: int, strict: bool = Fals
     if int(enable_path.read_text()) != 1:
         raise RuntimeError(f"PWM{number} manual mode was not accepted")
     initial = int(pwm_path.read_text())
+    if initial != value:
+        pwm_path.write_text(f"{value}\n")
+    return pwm_path, initial
+
+
+def write_pwm_verified(hwmon: Path, number: int, value: int, strict: bool = False) -> int:
+    pwm_path, initial = set_pwm_target(hwmon, number, value)
     if initial == value: return initial
     progress = 0
     previous = initial
-    for _ in range(2):
-        pwm_path.write_text(f"{value}\n")
-        progress = 0
-        stalled = 0
-        for _ in range(10):
-            time.sleep(0.1); actual = int(pwm_path.read_text())
-            if actual == value: return actual
-            if (value - initial) * (actual - previous) > 0 and abs(value - actual) < abs(value - initial):
-                progress += 1
-                stalled = 0
-            elif (value - initial) * (actual - previous) < 0:
-                progress = 0
-                stalled += 1
-            else:
-                stalled += 1
-            previous = actual
-        if progress >= 2 and stalled < 4 and abs(value - actual) < abs(value - initial) and not strict:
-            return actual
+    last_progress = -100
+    samples = 450 if strict else 50
+    for index in range(samples):
+        time.sleep(0.1); actual = int(pwm_path.read_text())
+        if actual == value: return actual
+        if (value - initial) * (actual - previous) > 0 and abs(value - actual) < abs(value - initial):
+            progress += 1
+            last_progress = index
+        elif (value - initial) * (actual - previous) < 0:
+            progress = 0
+        previous = actual
+    if not strict and progress >= 2 and samples - last_progress <= 20:
+        return actual
     raise RuntimeError(f"PWM{number} write verification failed: requested {value}, read {actual}")
 
 

@@ -230,14 +230,35 @@ class FailSafeTests(unittest.TestCase):
         config["fans"] = config["fans"][:1]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "pwm1").write_text("100\n")
             with mock.patch.object(fantop, "LOCK_FILE", root / "lock"), \
                  mock.patch.object(fantop, "find_hwmon", return_value=root), \
                  mock.patch.object(fantop, "read_sensors", side_effect=RuntimeError("sensor offline")), \
                  mock.patch.object(fantop, "get_logger", return_value=mock.Mock()), \
-                 mock.patch.object(fantop, "write_pwm_verified", return_value=255) as write, \
-                 self.assertRaisesRegex(RuntimeError, "Sensor failure"):
+                 mock.patch.object(fantop, "set_pwm_target", return_value=(root / "pwm1", 100)) as write, \
+                 mock.patch("time.sleep"), \
+                 self.assertRaisesRegex(RuntimeError, "fail-safe errors"):
                 fantop.apply_config(config, quiet=True)
-            write.assert_called_once_with(root, 1, 255, True)
+            write.assert_called_once_with(root, 1, 255)
+
+    def test_fail_safe_waits_for_all_hardware_ramps(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["fans"] = config["fans"][:2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for number in (1, 5):
+                (root / f"pwm{number}").write_text("100\n")
+            def ramp(_):
+                for number in (1, 5):
+                    path = root / f"pwm{number}"
+                    path.write_text(f"{min(255, int(path.read_text()) + 5)}\n")
+            with mock.patch.object(fantop, "set_pwm_target",
+                                   side_effect=lambda _, number, __: (root / f"pwm{number}", 100)) as write, \
+                 mock.patch("time.sleep", side_effect=ramp):
+                self.assertEqual(fantop.write_fail_safe(root, config), [])
+            self.assertEqual(write.call_count, 2)
+            self.assertEqual((root / "pwm1").read_text().strip(), "255")
+            self.assertEqual((root / "pwm5").read_text().strip(), "255")
 
     def test_failed_channel_recovers_all_channels(self):
         config = copy.deepcopy(fantop.DEFAULT_CONFIG)
@@ -294,7 +315,7 @@ class FailSafeTests(unittest.TestCase):
             root = Path(directory)
             (root / "pwm1").write_text("80\n")
             (root / "pwm1_enable").write_text("1\n")
-            readings = iter([80, 90, 100] + [100] * 20)
+            readings = iter([80, 90, 100] + [100] * 60)
             original_read = Path.read_text
             def read(path, *args, **kwargs):
                 return f"{next(readings)}\n" if path.name == "pwm1" else original_read(path, *args, **kwargs)
@@ -322,8 +343,7 @@ class FailSafeTests(unittest.TestCase):
             root = Path(directory)
             (root / "pwm1").write_text("80\n")
             (root / "pwm1_enable").write_text("99\n")
-            with mock.patch("os.access", return_value=True), mock.patch("time.sleep"), \
-                 mock.patch.object(fantop, "write_pwm_verified", side_effect=RuntimeError("readback stuck")):
+            with mock.patch.object(fantop, "set_pwm_target", side_effect=RuntimeError("readback stuck")):
                 self.assertIn("readback stuck", fantop.write_fail_safe(root, config)[0])
 
 

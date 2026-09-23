@@ -2,6 +2,15 @@
 
 All notable changes to fantop are documented here.
 
+## 4.0.4 - 2026-09-23
+
+### Fixed
+
+- Allow slow hwmon PWM ramps time to keep moving while still rejecting a stalled
+  partial ramp
+- Start all emergency fan ramps and wait for every channel to reach PWM 255;
+  report any channel that does not reach full speed
+
 ## 4.0.3 - 2026-09-23
 
 ### Fixed

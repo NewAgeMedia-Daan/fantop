@@ -167,6 +167,9 @@ emergency command uses the protected recovery copy even when the editable file
 cannot be read. A fan with calibration data and zero RPM receives a startup
 pulse; fantop raises it to PWM 255 if necessary and reports a failure if RPM
 does not appear. Keep fan tachometer feedback connected for this check.
+Hardware controlled ramps can take several seconds. The fail-safe command
+checks all configured channels until they read PWM 255 or the verification
+window expires, and reports any channel that does not reach full speed.
 
 ### TUI controls
 
