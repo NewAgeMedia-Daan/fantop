@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import shutil
+import shlex
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import Any
@@ -33,7 +34,7 @@ LEGACY_CRON_MARKERS = ("# fan-control-tui (managed; do not edit)",
 LEGACY_CONFIG_DIRS = (USER_HOME / ".config" / "nam-fan-control",
                       USER_HOME.parent / "fan-control-tui" / ".config" / "nam-fan-control",
                       Path.home() / ".config" / "nam-fan-control")
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.0.1"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 3,
@@ -271,17 +272,21 @@ def find_hwmon(config: dict[str, Any] | None = None) -> Path:
     controller = (config or DEFAULT_CONFIG).get("controller", {})
     if isinstance(controller, str): controller = {"name": controller, "path": "auto"}
     configured_path = controller.get("path", "auto")
-    if configured_path != "auto":
-        candidate = Path(configured_path)
-        if candidate.exists() and list(candidate.glob("pwm[0-9]*")): return candidate
     wanted = controller.get("name", "auto")
-    for path in Path("/sys/class/hwmon").glob("hwmon*"):
+    required = [fan["pwm"] for fan in (config or DEFAULT_CONFIG)["fans"] if fan.get("enabled", True)]
+    def matches(path: Path) -> bool:
         try:
             name = (path / "name").read_text().strip()
-            if (wanted in ("auto", name)) and any(re.fullmatch(r"pwm\d+", item.name) for item in path.glob("pwm*")):
-                return path
+            return (wanted == "auto" or name == wanted) and all(
+                (path / f"pwm{number}").exists() and (path / f"pwm{number}_enable").exists()
+                for number in required)
         except OSError:
-            pass
+            return False
+    if configured_path != "auto":
+        candidate = Path(configured_path)
+        if matches(candidate): return candidate
+    for path in Path("/sys/class/hwmon").glob("hwmon*"):
+        if matches(path): return path
     raise RuntimeError(f"Could not find configured hwmon controller '{wanted}'")
 
 
@@ -354,14 +359,14 @@ def read_live(config: dict[str, Any]) -> tuple[dict[str, float], dict[str, int],
         except (OSError, ValueError):
             pass
         try:
-            rpms[fan["id"]] = int((hwmon / f"fan{fan['fan_input']}_input").read_text())
+            rpms[fan["id"]] = int((hwmon / f"fan{fan.get('fan_input', fan['pwm'])}_input").read_text())
         except (OSError, ValueError):
             pass
     _, overrides = requested_pwms(config, temps)
     return temps, pwms, rpms, overrides
 
 
-def apply_config(config: dict[str, Any], quiet: bool = False) -> None:
+def apply_config(config: dict[str, Any], quiet: bool = False) -> bool:
     lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
     try:
         try:
@@ -369,24 +374,47 @@ def apply_config(config: dict[str, Any], quiet: bool = False) -> None:
         except BlockingIOError:
             if not quiet:
                 print("fan control is already running; skipped")
-            return
-        logger = get_logger(config); hwmon = find_hwmon(config)
+            return False
+        try:
+            logger = get_logger(config)
+        except OSError as exc:
+            logger = logging.getLogger("fantop-fallback")
+            if not logger.handlers: logger.addHandler(logging.StreamHandler(sys.stderr))
+            logger.setLevel(logging.WARNING)
+            logger.warning("Could not open operational log: %s", exc)
+        hwmon = find_hwmon(config)
+        sensor_error: Exception | None = None
         try:
             temps = read_sensors()
             targets, overrides = requested_pwms(config, temps)
             values = stabilize_pwms(config, temps, targets, load_state())
         except Exception as exc:
+            sensor_error = exc
             fail_safe = int(config.get("control", {}).get("fail_safe_pwm", 255))
             values = {fan["id"]: fail_safe for fan in config["fans"] if fan.get("enabled", True)}
             temps, overrides = {}, [f"FAIL-SAFE: {exc}"]
             logger.error("fail-safe PWM=%s reason=%s", fail_safe, exc)
+        observed: dict[str, int] = {}
+        errors: list[str] = []
         for fan in config["fans"]:
             if not fan.get("enabled", True): continue
             pwm = fan["pwm"]
-            actual = write_pwm_verified(hwmon, pwm, values[fan["id"]], bool(config["control"].get("strict_pwm_verification", False)))
-            if actual != values[fan["id"]]:
-                logger.warning("PWM%s hardware ramp/readback requested=%s current=%s", pwm, values[fan["id"]], actual)
-        save_state(temps, values)
+            try:
+                actual = write_pwm_verified(hwmon, pwm, values[fan["id"]],
+                                            bool(config["control"].get("strict_pwm_verification", False)))
+                observed[fan["id"]] = actual
+                if actual != values[fan["id"]]:
+                    logger.warning("PWM%s hardware ramp requested=%s current=%s", pwm, values[fan["id"]], actual)
+            except Exception as exc:
+                errors.append(f"PWM{pwm}: {exc}")
+        if errors:
+            recovery_errors = write_fail_safe(hwmon, config)
+            logger.critical("PWM write failure=%s; recovery failure=%s", errors, recovery_errors)
+            raise RuntimeError("PWM write failed: " + "; ".join(errors) +
+                               ("; fail-safe errors: " + "; ".join(recovery_errors) if recovery_errors else ""))
+        if sensor_error is not None:
+            raise RuntimeError(f"Sensor failure; fail-safe PWM applied: {sensor_error}") from sensor_error
+        save_state(temps, observed)
         logger.info("temps=%s pwm=%s overrides=%s", temps, values, overrides)
         if not quiet:
             keys = ("cpu", "hdd", "system", "vrm", "pch")
@@ -394,18 +422,30 @@ def apply_config(config: dict[str, Any], quiet: bool = False) -> None:
             print("PWM: " + " ".join(f"{key}={value}" for key, value in values.items()))
             if overrides:
                 print("Safety: " + "; ".join(overrides))
+        return True
     finally:
         os.close(lock_fd)
 
 
-def force_fail_safe(config: dict[str, Any]) -> None:
-    hwmon = find_hwmon(config); value = int(config.get("control", {}).get("fail_safe_pwm", 255))
+def write_fail_safe(hwmon: Path, config: dict[str, Any]) -> list[str]:
+    value = int(config.get("control", {}).get("fail_safe_pwm", 255))
+    errors: list[str] = []
     for fan in config["fans"]:
         if not fan.get("enabled", True): continue
         number = fan["pwm"]
-        (hwmon / f"pwm{number}_enable").write_text("1\n")
-        (hwmon / f"pwm{number}").write_text(f"{value}\n")
+        try:
+            (hwmon / f"pwm{number}_enable").write_text("1\n")
+            (hwmon / f"pwm{number}").write_text(f"{value}\n")
+        except Exception as exc:
+            errors.append(f"PWM{number}: {exc}")
+    return errors
+
+
+def force_fail_safe(config: dict[str, Any]) -> None:
+    hwmon = find_hwmon(config); value = int(config.get("control", {}).get("fail_safe_pwm", 255))
+    errors = write_fail_safe(hwmon, config)
     get_logger(config).critical("forced fail-safe PWM=%s", value)
+    if errors: raise RuntimeError("Fail-safe write errors: " + "; ".join(errors))
     print(f"Forced configured channels to fail-safe PWM {value}")
 
 
@@ -416,21 +456,26 @@ def write_pwm_verified(hwmon: Path, number: int, value: int, strict: bool = Fals
     enable_path.write_text("1\n")
     initial = int(pwm_path.read_text())
     if initial == value: return initial
+    progress = 0
+    previous = initial
     for _ in range(2):
         pwm_path.write_text(f"{value}\n")
         for _ in range(10):
             time.sleep(0.1); actual = int(pwm_path.read_text())
             if actual == value: return actual
-        if (value < initial and actual < initial) or (value > initial and actual > initial):
-            return actual  # Hardware-managed ramp is progressing toward target.
-    if strict: raise RuntimeError(f"PWM{number} write verification failed: requested {value}, read {actual}")
-    return actual
+            if (value - initial) * (actual - previous) > 0 and abs(value - actual) < abs(value - initial):
+                progress += 1
+            elif (value - initial) * (actual - previous) < 0:
+                progress = 0
+            previous = actual
+        if progress >= 2 and abs(value - actual) < abs(value - initial) and not strict: return actual
+    raise RuntimeError(f"PWM{number} write verification failed: requested {value}, read {actual}")
 
 
 def cron_line(config: dict[str, Any]) -> str:
     minutes = config.get("schedule_minutes", 1)
     expression = "* * * * *" if minutes == 1 else f"*/{minutes} * * * *"
-    return f"{expression} /usr/bin/python3 {SCRIPT} --apply >/dev/null 2>&1"
+    return f"{expression} /usr/bin/python3 {shlex.quote(str(SCRIPT))} --apply >/dev/null 2>&1"
 
 
 def install_cron(config: dict[str, Any]) -> None:
@@ -438,6 +483,8 @@ def install_cron(config: dict[str, Any]) -> None:
         raise PermissionError("Cron installation must run as root")
     if not shutil.which("crontab"): raise RuntimeError("crontab is not installed")
     proc = subprocess.run(["crontab", "-l"], text=True, capture_output=True)
+    if proc.returncode not in (0, 1):
+        raise RuntimeError(f"Could not read root crontab: {proc.stderr.strip()}")
     lines = proc.stdout.splitlines() if proc.returncode == 0 else []
     cleaned: list[str] = []
     skip_next = False
@@ -460,12 +507,17 @@ def install_cron(config: dict[str, Any]) -> None:
     print(f"Root cron ensured: {line}")
 
 
-def install_systemd(config: dict[str, Any]) -> None:
-    if os.geteuid() != 0: raise PermissionError("Scheduler installation must run as root")
+def systemd_units(config: dict[str, Any]) -> tuple[str, str, str]:
     minutes = config.get("schedule_minutes", 1)
     service = f"""[Unit]\nDescription=fantop curve application\nAfter=lm-sensors.service\nOnFailure=fantop-failsafe.service\n\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 \"{SCRIPT}\" --apply\n"""
     failsafe_service = f"""[Unit]\nDescription=fantop emergency fail-safe\n\n[Service]\nType=oneshot\nExecStart=/usr/bin/python3 \"{SCRIPT}\" --fail-safe\n"""
     timer = f"""[Unit]\nDescription=Run fantop every {minutes} minute(s)\n\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec={minutes}min\nAccuracySec=1s\nPersistent=true\nUnit=fantop.service\n\n[Install]\nWantedBy=timers.target\n"""
+    return service, failsafe_service, timer
+
+
+def install_systemd(config: dict[str, Any]) -> None:
+    if os.geteuid() != 0: raise PermissionError("Scheduler installation must run as root")
+    service, failsafe_service, timer = systemd_units(config)
     Path("/etc/systemd/system/fantop.service").write_text(service)
     Path("/etc/systemd/system/fantop.timer").write_text(timer)
     Path("/etc/systemd/system/fantop-failsafe.service").write_text(failsafe_service)
@@ -488,7 +540,8 @@ def remove_cron() -> None:
     if os.geteuid() != 0: return
     if not shutil.which("crontab"): return
     proc = subprocess.run(["crontab", "-l"], text=True, capture_output=True)
-    if proc.returncode != 0: return
+    if proc.returncode == 1: return
+    if proc.returncode != 0: raise RuntimeError(f"Could not read root crontab: {proc.stderr.strip()}")
     lines, cleaned, skip = proc.stdout.splitlines(), [], False
     for line in lines:
         if line.strip() in (CRON_MARKER, *LEGACY_CRON_MARKERS):
@@ -499,22 +552,45 @@ def remove_cron() -> None:
 
 
 def install_scheduler(config: dict[str, Any]) -> None:
-    if shutil.which("systemctl") and Path("/run/systemd/system").exists():
+    choice = config.get("scheduler", "auto")
+    systemd_available = bool(shutil.which("systemctl") and Path("/run/systemd/system").exists())
+    if choice == "systemd" and not systemd_available:
+        raise RuntimeError("systemd was requested but is not available")
+    if choice == "systemd" or (choice == "auto" and systemd_available):
         install_systemd(config)
     else:
         install_cron(config)
+        remove_systemd()
+
+
+def activate_config(path: Path) -> None:
+    if os.geteuid() != 0: raise PermissionError("Activation must run as root")
+    with path.open(encoding="utf-8") as handle:
+        candidate = validate_config(json.load(handle))
+    if not apply_config(candidate):
+        raise RuntimeError("Fan control is already running; configuration was not activated")
+    install_scheduler(candidate)
+    atomic_save(candidate)
+    if os.geteuid() == 0 and path.stat().st_uid != 0:
+        os.chown(CONFIG_FILE, path.stat().st_uid, path.stat().st_gid)
+    print("Configuration applied, scheduled, and saved")
+
+
+def remove_systemd() -> None:
+    running = bool(shutil.which("systemctl") and Path("/run/systemd/system").exists())
+    if running:
+        subprocess.run(["systemctl", "disable", "--now", "fantop.timer"], capture_output=True)
+    for name in ("fantop.timer", "fantop.service", "fantop-failsafe.service"):
+        try: (Path("/etc/systemd/system") / name).unlink()
+        except FileNotFoundError: pass
+    if running:
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
 
 
 def uninstall_scheduler() -> None:
     if os.geteuid() != 0: raise PermissionError("Uninstall must run as root")
-    if shutil.which("systemctl"):
-        subprocess.run(["systemctl", "disable", "--now", "fantop.timer"], capture_output=True)
-        remove_legacy_systemd()
-    for path in (Path("/etc/systemd/system/fantop.timer"), Path("/etc/systemd/system/fantop.service"),
-                 Path("/etc/systemd/system/fantop-failsafe.service")):
-        try: path.unlink()
-        except FileNotFoundError: pass
-    if shutil.which("systemctl"): subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    remove_systemd()
+    remove_legacy_systemd()
     remove_cron(); print("fantop scheduler removed")
 
 
@@ -550,6 +626,16 @@ def setup_from_discovery(config: dict[str, Any], overwrite: bool = False) -> dic
 def calibrate(config: dict[str, Any], confirmed: bool = False) -> None:
     if os.geteuid() != 0: raise PermissionError("Calibration must run as root")
     if not confirmed: raise RuntimeError("Calibration changes fan speeds; repeat with --yes")
+    lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try: fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc: raise RuntimeError("Fan control is already running") from exc
+        _calibrate_locked(config)
+    finally:
+        os.close(lock_fd)
+
+
+def _calibrate_locked(config: dict[str, Any]) -> None:
     hwmon = find_hwmon(config); logger = get_logger(config)
     for fan in config["fans"]:
         if not fan.get("enabled", True): continue
@@ -564,7 +650,8 @@ def calibrate(config: dict[str, Any], confirmed: bool = False) -> None:
                 rpm = int(tach.read_text()) if tach.exists() else 0; samples.append([pwm, rpm])
                 if pwm < 255 and rpm == 0: break
         finally:
-            pwm_path.write_text(old_pwm + "\n"); enable.write_text(old_enable + "\n")
+            try: pwm_path.write_text(old_pwm + "\n")
+            finally: enable.write_text(old_enable + "\n")
         spinning = [sample for sample in samples if sample[1] > 0]
         fan["calibration"] = {"tested_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "minimum_pwm": min((pwm for pwm, _ in spinning), default=None),
@@ -573,6 +660,33 @@ def calibrate(config: dict[str, Any], confirmed: bool = False) -> None:
         logger.info("calibration fan=%s samples=%s", fan["id"], samples)
         print(f"{fan['name']}: {samples}")
     atomic_save(config); print("Calibration saved; original PWM modes and values restored")
+
+
+def scheduler_active(config: dict[str, Any]) -> bool:
+    choice = config.get("scheduler", "auto")
+    systemd_available = bool(shutil.which("systemctl") and Path("/run/systemd/system").exists())
+    if choice == "systemd" or (choice == "auto" and systemd_available):
+        if not systemd_available: return False
+        service, failsafe, timer = systemd_units(config)
+        unit_dir = Path("/etc/systemd/system")
+        try:
+            exact = (unit_dir / "fantop.service").read_text() == service and (
+                unit_dir / "fantop-failsafe.service").read_text() == failsafe and (
+                unit_dir / "fantop.timer").read_text() == timer
+        except OSError:
+            return False
+        active = subprocess.run(["systemctl", "is-active", "fantop.timer"], capture_output=True, text=True)
+        return exact and active.returncode == 0 and active.stdout.strip() == "active"
+    if not shutil.which("crontab") or not shutil.which("sudo"): return False
+    if systemd_available:
+        daemon = any(subprocess.run(["systemctl", "is-active", name], capture_output=True, text=True).returncode == 0
+                     for name in ("cron", "crond"))
+        if not daemon: return False
+    root_cron = subprocess.run(["sudo", "-n", "crontab", "-l"], capture_output=True, text=True)
+    lines = root_cron.stdout.splitlines()
+    return root_cron.returncode == 0 and any(
+        line.strip() == CRON_MARKER and index + 1 < len(lines) and lines[index + 1] == cron_line(config)
+        for index, line in enumerate(lines))
 
 
 class FantopTUI:
@@ -640,22 +754,17 @@ class FantopTUI:
         self.last_live = time.monotonic()
         try:
             self.temps, self.pwms, self.rpms, self.overrides = read_live(self.config)
+            if self.status.startswith("Live data:"):
+                self.status, self.status_error = "Live data restored", False
         except Exception as exc:
+            self.temps, self.pwms, self.rpms, self.overrides = {}, {}, {}, []
             self.status, self.status_error = f"Live data: {exc}", True
 
     def refresh_schedule(self, force: bool = False) -> None:
         if not force and time.monotonic() - self.last_schedule_check < 5:
             return
         self.last_schedule_check = time.monotonic()
-        active = subprocess.run(["systemctl", "is-active", "fantop.timer"], capture_output=True, text=True) if shutil.which("systemctl") else None
-        timer = Path("/etc/systemd/system/fantop.timer")
-        try: correct = f"OnUnitActiveSec={self.config.get('schedule_minutes', 1)}min" in timer.read_text()
-        except OSError: correct = False
-        self.schedule_active = active is not None and active.stdout.strip() == "active" and correct
-        if not self.schedule_active:
-            daemon = subprocess.run(["systemctl", "is-active", "cron"], capture_output=True, text=True).stdout.strip() == "active" if shutil.which("systemctl") else True
-            root_cron = subprocess.run(["sudo", "-n", "crontab", "-l"], capture_output=True, text=True) if shutil.which("crontab") else None
-            self.schedule_active = bool(root_cron and daemon and root_cron.returncode == 0 and CRON_MARKER in root_cron.stdout and cron_line(self.config) in root_cron.stdout)
+        self.schedule_active = scheduler_active(self.config)
 
     def graph_line(self, fan: dict[str, Any], y: int, x: int, h: int, w: int) -> None:
         for col in range(max(5, w)):
@@ -833,17 +942,24 @@ class FantopTUI:
         finally: self.screen.timeout(500)
 
     def save_apply(self) -> None:
+        pending: Path | None = None
         try:
-            atomic_save(self.config)
-            result = self.terminal_command(["sudo", sys.executable, str(SCRIPT), "--install-scheduler", "--apply"])
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            fd, name = tempfile.mkstemp(prefix=".pending-config.", dir=CONFIG_FILE.parent)
+            os.close(fd); pending = Path(name)
+            atomic_save(self.config, pending)
+            result = self.terminal_command(["sudo", sys.executable, str(SCRIPT), "--activate-config", str(pending)])
             if result.returncode == 0:
                 self.saved = copy.deepcopy(self.config)
                 self.status, self.status_error = "Saved, applied, and scheduler ensured", False
                 self.refresh_live(True)
             else:
-                self.status, self.status_error = "Config saved, but apply/scheduler failed", True
+                self.status, self.status_error = "Apply or scheduler failed; config remains unsaved", True
         except Exception as exc:
             self.status, self.status_error = f"Save failed: {exc}", True
+        finally:
+            if pending is not None:
+                pending.unlink(missing_ok=True)
 
     def export_config(self) -> None:
         confirmed, label = self.export_name_prompt()
@@ -1166,6 +1282,7 @@ def main() -> int:
     parser.add_argument("--fail-safe", action="store_true", help="force configured channels to fail-safe PWM")
     parser.add_argument("--install-cron", action="store_true", help="install cron fallback scheduler")
     parser.add_argument("--install-scheduler", action="store_true", help="install systemd timer or cron fallback")
+    parser.add_argument("--activate-config", type=Path, metavar="FILE", help=argparse.SUPPRESS)
     parser.add_argument("--uninstall-scheduler", action="store_true", help="remove managed systemd/cron scheduler")
     parser.add_argument("--restore-auto", action="store_true", help="restore firmware/automatic PWM mode")
     parser.add_argument("--setup", action="store_true", help="create config from active discovered channels")
@@ -1183,6 +1300,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         config = load_config()
+        if args.activate_config: activate_config(args.activate_config)
         if args.setup: config = setup_from_discovery(config, args.yes)
         if args.init_config and not CONFIG_FILE.exists(): atomic_save(config); print(f"Created {CONFIG_FILE}")
         if args.schedule: config["schedule_minutes"] = args.schedule; atomic_save(config)
@@ -1208,7 +1326,7 @@ def main() -> int:
                 for channel in controller['channels']:
                     state = "active" if channel['active'] else "inactive"
                     print(f"  PWM{channel['pwm']}: {state}, RPM={channel['rpm']}, writable={channel['writable']}")
-        actions = (args.apply, args.fail_safe, args.install_cron, args.install_scheduler, args.uninstall_scheduler,
+        actions = (args.activate_config, args.apply, args.fail_safe, args.install_cron, args.install_scheduler, args.uninstall_scheduler,
                    args.restore_auto, args.setup, args.calibrate, args.status, args.dry_run,
                    args.log_tail, args.init_config, args.doctor, args.discover, args.schedule)
         if not any(actions): run_tui(config)

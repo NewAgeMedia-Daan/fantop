@@ -16,12 +16,16 @@ elif [[ -f "$LEGACY_DIR/.config/nam-fan-control/config.json" && ! -f "$INSTALL_D
   mkdir -p "$INSTALL_DIR/.config/fantop"
   cp -a "$LEGACY_DIR/.config/nam-fan-control/." "$INSTALL_DIR/.config/fantop/"
 fi
-install -m 755 "$SOURCE_DIR/fantop.py" "$INSTALL_DIR/fantop.py"
-install -m 755 "$SOURCE_DIR/fantop" "$INSTALL_DIR/fantop"
+install -m 755 "$SOURCE_DIR/fantop.py" "$INSTALL_DIR/.fantop.py.new"
+mv -f "$INSTALL_DIR/.fantop.py.new" "$INSTALL_DIR/fantop.py"
+install -m 755 "$SOURCE_DIR/fantop" "$INSTALL_DIR/.fantop.new"
+mv -f "$INSTALL_DIR/.fantop.new" "$INSTALL_DIR/fantop"
 install -m 644 "$SOURCE_DIR/README.md" "$INSTALL_DIR/README.md"
 ln -sfn "$INSTALL_DIR/fantop" "$BIN_DIR/fantop"
 rm -f "$BIN_DIR/fan-control"
-if [[ -w "$(dirname -- "$SYSTEM_LAUNCHER")" ]]; then
+if [[ -L "$SYSTEM_LAUNCHER" && "$(readlink -f -- "$SYSTEM_LAUNCHER")" == "$INSTALL_DIR/fantop" ]]; then
+  :
+elif [[ -w "$(dirname -- "$SYSTEM_LAUNCHER")" ]]; then
   ln -sfn "$INSTALL_DIR/fantop" "$SYSTEM_LAUNCHER"
 elif command -v sudo >/dev/null 2>&1; then
   sudo ln -sfn "$INSTALL_DIR/fantop" "$SYSTEM_LAUNCHER"

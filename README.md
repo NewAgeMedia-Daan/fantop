@@ -121,7 +121,8 @@ Discovery is read-only and does not change fan speeds.
 4. Launch `fantop`, label each active header, select temperature sources,
    and review every curve.
 5. Save from the TUI. Saving requests sudo access, applies the curves immediately,
-   and creates or updates the managed systemd timer or root cron fallback.
+   and creates or updates the managed systemd timer or root cron fallback. The
+   saved configuration changes only after application and scheduler setup succeed.
 6. Confirm that the footer shows green `SCHEDULE ACTIVE` and run
    `fantop --status` to verify temperatures, requested PWM, live PWM, and RPM.
 7. Test cooling under load before relying on unattended operation.
@@ -134,6 +135,9 @@ sudo fantop --install-scheduler
 ```
 
 Supported intervals are 1, 2, 3, 5, 10, 15, 30, and 60 minutes.
+The JSON `scheduler` setting accepts `auto`, `systemd`, or `cron`. `auto` uses
+systemd when it is running and otherwise uses cron. Selecting an unavailable
+scheduler fails with an error instead of silently selecting another one.
 
 ## Usage
 
@@ -274,16 +278,21 @@ manual mode. Keep a firmware/BIOS fallback available and test curves under load.
 The default profile includes HDD and board-temperature airflow floors. Review
 and adapt every sensor mapping and safety threshold for the target hardware.
 If required temperatures cannot be read, configured channels are driven to the
-fail-safe PWM (255 by default). Upward fan changes are immediate; downward
-changes use configurable hysteresis and smoothing. Calibration always restores
-the original PWM values and enable modes in a `finally` path.
+fail-safe PWM (255 by default), and the apply command exits with an error.
+If a PWM write fails, fantop attempts fail-safe writes on every configured
+channel and reports any recovery failures. An unchanged PWM readback counts as
+a failed write; a progressing hardware ramp is accepted unless strict PWM
+verification is enabled. Upward fan changes are immediate; downward
+changes use configurable hysteresis and smoothing. Calibration attempts to restore
+the original PWM values and enable modes in a `finally` path, and shares the
+controller lock with scheduled application.
 The systemd service also has an `OnFailure` emergency unit that forces fail-safe
 PWM if the normal apply process crashes before its internal handler completes.
 Every normal PWM write is polled for asynchronous readback. Exact convergence
-or hardware-ramp movement is recorded; delayed mismatches are logged as warnings
-because some controllers ramp their readable register slowly. Controllers with
-immediate readback can opt into `strict_pwm_verification` in the JSON config.
-Write errors and strict-verification failures activate the emergency fail-safe.
+or repeated movement toward the target is recorded. Controllers with immediate
+readback can opt into `strict_pwm_verification` in the JSON config, which
+requires exact convergence. Persistent mismatches activate the emergency
+fail-safe.
 
 To uninstall safely, run `./uninstall.sh`; it offers to restore firmware control
 before removing the scheduler and application files.

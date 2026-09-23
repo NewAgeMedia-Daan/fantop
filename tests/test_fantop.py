@@ -13,6 +13,25 @@ SPEC.loader.exec_module(fantop)
 
 
 class ConfigTests(unittest.TestCase):
+    def test_hwmon_path_requires_identity_and_channels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bad, good = root / "bad", root / "good"
+            bad.mkdir(); good.mkdir()
+            (bad / "name").write_text("wrong\n")
+            (bad / "pwm1").write_text("80\n")
+            (bad / "pwm1_enable").write_text("1\n")
+            (good / "name").write_text("expected\n")
+            (good / "pwm1").write_text("80\n")
+            (good / "pwm1_enable").write_text("1\n")
+            config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+            config["fans"] = config["fans"][:1]
+            config["controller"] = {"name": "expected", "path": str(bad)}
+            original_glob = Path.glob
+            with mock.patch.object(Path, "glob", autospec=True,
+                                   side_effect=lambda path, pattern: [good] if str(path) == "/sys/class/hwmon" else original_glob(path, pattern)):
+                self.assertEqual(fantop.find_hwmon(config), good)
+
     def test_legacy_config_location_migrates(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); old = root / "old"; old.mkdir(); new = root / "new" / "config.json"
@@ -111,9 +130,145 @@ class FailSafeTests(unittest.TestCase):
                  mock.patch.object(fantop, "read_sensors", side_effect=RuntimeError("sensor offline")), \
                  mock.patch.object(fantop, "get_logger", return_value=mock.Mock()), \
                  mock.patch("os.access", return_value=True):
-                fantop.apply_config(config, quiet=True)
+                with self.assertRaisesRegex(RuntimeError, "Sensor failure"):
+                    fantop.apply_config(config, quiet=True)
             self.assertEqual((root / "pwm1").read_text().strip(), "255")
             self.assertEqual((root / "pwm1_enable").read_text().strip(), "1")
+
+    def test_failed_channel_recovers_all_channels(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["fans"] = config["fans"][:2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for number in (1, 5):
+                (root / f"pwm{number}").write_text("80\n")
+                (root / f"pwm{number}_enable").write_text("99\n")
+            def write(_, number, value, strict=False):
+                if number == 1: raise OSError("controller rejected write")
+                (root / f"pwm{number}").write_text(f"{value}\n")
+                return value
+            with mock.patch.object(fantop, "LOCK_FILE", root / "lock"), \
+                 mock.patch.object(fantop, "find_hwmon", return_value=root), \
+                 mock.patch.object(fantop, "read_sensors", return_value={"cpu": 50, "hdd": 35, "board": 40}), \
+                 mock.patch.object(fantop, "load_state", return_value={}), \
+                 mock.patch.object(fantop, "get_logger", return_value=mock.Mock()), \
+                 mock.patch.object(fantop, "write_pwm_verified", side_effect=write):
+                with self.assertRaisesRegex(RuntimeError, "PWM write failed"):
+                    fantop.apply_config(config, quiet=True)
+            self.assertEqual((root / "pwm1").read_text().strip(), "255")
+            self.assertEqual((root / "pwm5").read_text().strip(), "255")
+
+    def test_ramping_readback_is_saved_as_observed_state(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["fans"] = config["fans"][:1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(fantop, "LOCK_FILE", root / "lock"), \
+                 mock.patch.object(fantop, "find_hwmon", return_value=root), \
+                 mock.patch.object(fantop, "read_sensors", return_value={"cpu": 50}), \
+                 mock.patch.object(fantop, "load_state", return_value={}), \
+                 mock.patch.object(fantop, "get_logger", return_value=mock.Mock()), \
+                 mock.patch.object(fantop, "write_pwm_verified", return_value=88), \
+                 mock.patch.object(fantop, "save_state") as state:
+                self.assertTrue(fantop.apply_config(config, quiet=True))
+            state.assert_called_once_with({"cpu": 50}, {"cpu": 88})
+
+    def test_unresponsive_pwm_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pwm1").write_text("80\n")
+            (root / "pwm1_enable").write_text("99\n")
+            original_read = Path.read_text
+            with mock.patch("os.access", return_value=True), mock.patch("time.sleep"), \
+                 mock.patch.object(Path, "read_text", autospec=True,
+                                   side_effect=lambda path, *args, **kwargs: "80\n" if path.name == "pwm1" else original_read(path, *args, **kwargs)):
+                with self.assertRaisesRegex(RuntimeError, "verification failed"):
+                    fantop.write_pwm_verified(root, 1, 173)
+
+
+class SchedulerTests(unittest.TestCase):
+    def test_crond_counts_as_active(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["scheduler"] = "cron"
+        root_cron = f"{fantop.CRON_MARKER}\n{fantop.cron_line(config)}\n"
+        import subprocess
+        responses = [subprocess.CompletedProcess([], 3, ""),
+                     subprocess.CompletedProcess([], 0, "active\n"),
+                     subprocess.CompletedProcess([], 0, root_cron)]
+        original_exists = Path.exists
+        with mock.patch.object(Path, "exists", autospec=True,
+                               side_effect=lambda path: True if str(path) == "/run/systemd/system" else original_exists(path)), \
+             mock.patch.object(fantop.shutil, "which", return_value="/usr/bin/mock"), \
+             mock.patch.object(fantop.subprocess, "run", side_effect=responses):
+            self.assertTrue(fantop.scheduler_active(config))
+
+    def test_explicit_cron_is_honored(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        config["scheduler"] = "cron"
+        with mock.patch.object(fantop, "install_cron") as cron, \
+             mock.patch.object(fantop, "install_systemd") as systemd, \
+             mock.patch.object(fantop, "remove_systemd") as remove:
+            fantop.install_scheduler(config)
+        cron.assert_called_once_with(config)
+        systemd.assert_not_called()
+        remove.assert_called_once()
+
+    def test_calibration_refuses_active_controller(self):
+        config = copy.deepcopy(fantop.DEFAULT_CONFIG)
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "lock"
+            import fcntl
+            import os
+            fd = os.open(lock, os.O_CREAT | os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with mock.patch.object(fantop, "LOCK_FILE", lock), \
+                     mock.patch("os.geteuid", return_value=0), \
+                     mock.patch.object(fantop, "_calibrate_locked") as calibrate:
+                    with self.assertRaisesRegex(RuntimeError, "already running"):
+                        fantop.calibrate(config, confirmed=True)
+                calibrate.assert_not_called()
+            finally:
+                os.close(fd)
+
+    def test_activation_does_not_save_when_apply_is_busy(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pending = root / "pending.json"
+            live = root / "config.json"
+            pending.write_text(json.dumps(fantop.DEFAULT_CONFIG))
+            with mock.patch.object(fantop, "CONFIG_FILE", live), \
+                 mock.patch("os.geteuid", return_value=0), \
+                 mock.patch.object(fantop, "apply_config", return_value=False), \
+                 mock.patch.object(fantop, "install_scheduler") as scheduler:
+                with self.assertRaisesRegex(RuntimeError, "not activated"):
+                    fantop.activate_config(pending)
+            self.assertFalse(live.exists())
+            scheduler.assert_not_called()
+
+    def test_activation_does_not_save_when_scheduler_fails(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pending = root / "pending.json"
+            live = root / "config.json"
+            pending.write_text(json.dumps(fantop.DEFAULT_CONFIG))
+            with mock.patch.object(fantop, "CONFIG_FILE", live), \
+                 mock.patch("os.geteuid", return_value=0), \
+                 mock.patch.object(fantop, "apply_config", return_value=True), \
+                 mock.patch.object(fantop, "install_scheduler", side_effect=RuntimeError("scheduler failed")):
+                with self.assertRaisesRegex(RuntimeError, "scheduler failed"):
+                    fantop.activate_config(pending)
+            self.assertFalse(live.exists())
+
+    def test_live_data_clears_after_error(self):
+        tui = fantop.FantopTUI(mock.Mock(), copy.deepcopy(fantop.DEFAULT_CONFIG))
+        tui.temps, tui.pwms, tui.rpms = {"cpu": 60}, {"cpu": 100}, {"cpu": 1200}
+        with mock.patch.object(fantop, "read_live", side_effect=RuntimeError("sensor offline")):
+            tui.refresh_live(force=True)
+        self.assertEqual((tui.temps, tui.pwms, tui.rpms), ({}, {}, {}))
+        self.assertTrue(tui.status_error)
 
 
 if __name__ == "__main__":
